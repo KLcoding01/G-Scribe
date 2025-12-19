@@ -1,19 +1,12 @@
 {
-  "name": "kelvin-pt-note-bot",
-  "version": "1.0.0",
-  "description": "Kelvin PT Note Reviser\u2013style bot (Express + OpenAI) with strict formatting/validation",
-  "main": "server.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
-  },
+  "name": "pt-summary-backend",
+  "type": "module",
+  "private": true,
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "helmet": "^7.1.0",
-    "openai": "^4.67.3",
-    "zod": "^3.23.8"
+    "openai": "^4.0.0"
   }
 }
