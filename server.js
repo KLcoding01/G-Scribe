@@ -1,23 +1,14 @@
 // server.js (DROP-IN, FULLY UPDATED)
-// PT Summary backend for iOS client (SwiftUI)
+// PT/OT Summary backend for iOS client (SwiftUI)
 //
-// What this version fixes/implements:
-// - Uses dotenv (so Render + local .env work reliably)
-// - Adds /health, /debug-env, /clean, /generate
-// - Hard-enforces output format: EXACTLY 3 sections (Subjective / Summary / POC)
-// - Subjective: 1 sentence, MUST start with allowed starters, MUST be patient-reported only
-// - Summary: 5–7 sentences, abbrev only, no arrows, no banned generic openers
-// - Summary intro: rotated per patient (server-side), enforced as exact prefix on first Summary sentence
-// - Summary final sentence: varies BUT MUST CONTAIN the exact substring:
-//     "Continued skilled PT remains indicated"
-// - POC: one line, "PT POC:" + rotated opener (server-side) + required phrase content
-// - No hallucination guard: forbids new numbers/devices/vitals/etc unless userText includes them
-// - Auto-repair pass if the model violates constraints (1 retry)
-//
-// IMPORTANT:
-// - Ensure package.json includes: "dotenv": "^16.4.5" (or newer).
-// - On Render, set OPENAI_API_KEY and OPENAI_MODEL in Environment Variables.
-// - Render provides PORT automatically; this uses process.env.PORT.
+// Key behaviors:
+// - /health, /debug-env, /clean, /generate
+// - Enforces EXACT output format: 3 sections (Subjective / Summary / POC)
+// - Summary intro rotated per patient, enforced as exact prefix
+// - Summary closing sentence MUST CONTAIN:
+//     "Continued skilled PT remains indicated"  (PT)
+//     "Continued skilled OT remains indicated"  (OT)
+// - POC is one line and must be exact discipline-specific template
 
 import express from "express";
 import cors from "cors";
@@ -35,7 +26,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 // Basic sanity logging (does not print full key)
-console.log("Booting PT summary backend...");
+console.log("Booting PT/OT summary backend...");
 console.log("PORT =", PORT);
 console.log("MODEL =", MODEL);
 console.log(
@@ -50,60 +41,30 @@ if (!OPENAI_API_KEY) {
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// ---------------- Utilities ----------------
+// ---------------- Small Utilities ----------------
 
 function normalizeSpaces(s) {
   return String(s || "")
   .replace(/\r\n/g, "\n")
   .replace(/[ \t]+/g, " ")
-  .replace(/\u00A0/g, " ")
   .replace(/\n{3,}/g, "\n\n")
   .trim();
 }
 
-function countSentences(text) {
-  const t = String(text || "").trim();
-  if (!t) return 0;
-  // Count sentence endings; tolerate clinical abbreviations by requiring end punctuation.
-  const matches = t.match(/[.!?](?=\s|$)/g);
-  return matches ? matches.length : 0;
-}
-
-function splitSections(noteText) {
-  const t = normalizeSpaces(noteText);
-  // Expect:
-  // Subjective\n...\n\nSummary\n...\n\nPOC\n...
-  const re =
-  /^Subjective\s*\n([\s\S]*?)\n\nSummary\s*\n([\s\S]*?)\n\nPOC\s*\n([\s\S]*?)$/i;
-  const m = t.match(re);
-  if (!m) return null;
-  return {
-    subjective: m[1].trim(),
-    summary: m[2].trim(),
-    poc: m[3].trim(),
-    raw: t,
-  };
-}
-
-function containsAnyNumbers(str) {
-  return /\d/.test(String(str || ""));
-}
-
-function hasArrowChars(str) {
-  return /[↑↓]/.test(String(str || ""));
-}
-
-function lineIsSingleLine(str) {
+function isSingleLine(str) {
   return !String(str || "").includes("\n");
 }
 
-function includesExactClosingPhrase(lastSentence) {
-  return String(lastSentence || "").includes("Continued skilled PT remains indicated");
+function includesExactClosingPhrase(lastSentence, discipline) {
+  const needle =
+  discipline === "OT"
+  ? "Continued skilled OT remains indicated"
+  : "Continued skilled PT remains indicated";
+  return String(lastSentence || "").includes(needle);
 }
 
 function getLastSentence(text) {
   const t = String(text || "").trim();
-  // Split on sentence terminators while keeping terminator
   const parts = t.split(/(?<=[.!?])\s+/).filter(Boolean);
   return parts.length ? parts[parts.length - 1].trim() : "";
 }
@@ -117,7 +78,11 @@ function cleanUserText(rawText) {
   t = t.replace(/[•●◦▪️]/g, "-");
   
   // De-dupe identical lines
-  const lines = t.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const lines = t
+  .split(/\r?\n/)
+  .map((l) => l.trim())
+  .filter(Boolean);
+  
   const out = [];
   const seen = new Set();
   for (const line of lines) {
@@ -127,28 +92,25 @@ function cleanUserText(rawText) {
     out.push(line);
   }
   
-  // Join with newline then normalize whitespace
-  return normalizeSpaces(out.join("\n"));
+  // Keep it reasonable
+  return out.joined ? out.joined("\n") : out.join("\n");
 }
 
-function buildCleanPrompt(rawText) {
-  return `
-Task: Clean the user's PT visit instruction for clarity WITHOUT adding new facts.
+// ---------------- Patient-based rotation (stable variations) ----------------
 
-Rules:
-- Do NOT add any clinical details that are not explicitly present.
-- Keep abbreviations (LBP, C/S, ROM, TherEx, TherAct, MT, STM, VC/TC, ADLs, PLOF, etc.).
-- Remove filler words and repeated phrases.
-- Keep it as a single concise paragraph (no bullets, no numbering).
+const patientMemory = new Map();
 
-Input:
-${rawText}
-
-Output ONLY the cleaned text (no quotes, no labels).
-`.trim();
+function pickForPatient(patientKey, arr) {
+  const key = `${patientKey}::${arr.length}`;
+  let idx = patientMemory.get(key);
+  if (idx == null) {
+    idx = Math.floor(Math.random() * arr.length);
+  } else {
+    idx = (idx + 1) % arr.length;
+  }
+  patientMemory.set(key, idx);
+  return arr[idx];
 }
-
-// ---------------- Variation (server-side rotation) ----------------
 
 const SUMMARY_INTRO_PREFIXES = [
   "Today, pt ",
@@ -163,14 +125,20 @@ const SUMMARY_INTRO_PREFIXES = [
   "Functional mobility indicates pt ",
 ];
 
-// Closing sentences must CONTAIN the exact substring
-// "Continued skilled PT remains indicated" but can vary around it.
 const SUMMARY_CLOSERS = [
   "Continued skilled PT remains indicated to progress POC and support functional carryover to ADLs.",
   "Continued skilled PT remains indicated to address impairments and promote safe mobility to meet goals.",
-  "Continued skilled PT remains indicated to improve strength, ROM, and functional tolerance for ADLs and PLOF.",
-  "Continued skilled PT remains indicated to reduce fall/injury risk and improve safe functional performance.",
+  "Continued skilled PT remains indicated to improve strength, ROM, and functional tolerance for PLOF.",
+  "Continued skilled PT remains indicated to reduce fall/injury risk and improve safe functional independence.",
   "Continued skilled PT remains indicated to advance therapeutic progression and optimize functional outcomes.",
+];
+
+const OT_SUMMARY_CLOSERS = [
+  "Continued skilled OT remains indicated to progress POC and support functional carryover to ADLs.",
+  "Continued skilled OT remains indicated to address impairments and promote safe performance of ADLs/IADLs to meet goals.",
+  "Continued skilled OT remains indicated to improve UE function, coordination, and task tolerance for ADLs and PLOF.",
+  "Continued skilled OT remains indicated to reduce fall/injury risk and improve safe functional independence.",
+  "Continued skilled OT remains indicated to advance therapeutic progression and optimize functional outcomes.",
 ];
 
 const POC_OPENERS = [
@@ -184,102 +152,171 @@ const POC_OPENERS = [
   "Advance POC with continued emphasis on",
 ];
 
-const patientCounters = new Map();
-
-function nextIndexForPatient(patientLabel) {
-  const n = (patientCounters.get(patientLabel) || 0) + 1;
-  patientCounters.set(patientLabel, n);
-  return n - 1;
-}
-
-function pickForPatient(patientLabel, arr) {
-  const idx = nextIndexForPatient(patientLabel);
-  return arr[idx % arr.length];
-}
+const OT_POC_OPENERS = [
+  "Continue to focus on",
+  "Plan to progress",
+  "Continue skilled OT emphasizing",
+  "Continue with a focus on",
+  "Proceed with ongoing skilled OT targeting",
+  "Maintain POC with emphasis on",
+  "Continue intervention focus on",
+  "Advance POC with continued emphasis on",
+];
 
 function pickIntroPrefix(patientLabel) {
   return pickForPatient(`${patientLabel}::intro`, SUMMARY_INTRO_PREFIXES);
 }
 
 function pickCloser(patientLabel) {
-  return pickForPatient(`${patientLabel}::close`, SUMMARY_CLOSERS);
+  return pickForPatient(`${patientLabel}::closePT`, SUMMARY_CLOSERS);
 }
 
 function pickPocOpener(patientLabel) {
-  return pickForPatient(`${patientLabel}::poc`, POC_OPENERS);
+  return pickForPatient(`${patientLabel}::pocPT`, POC_OPENERS);
 }
 
-// ---------------- Prompt Builders ----------------
+function pickCloserForDiscipline(patientLabel, discipline) {
+  return discipline === "OT"
+  ? pickForPatient(`${patientLabel}::closeOT`, OT_SUMMARY_CLOSERS)
+  : pickForPatient(`${patientLabel}::closePT`, SUMMARY_CLOSERS);
+}
+
+function pickPocOpenerForDiscipline(patientLabel, discipline) {
+  return discipline === "OT"
+  ? pickForPatient(`${patientLabel}::pocOT`, OT_POC_OPENERS)
+  : pickForPatient(`${patientLabel}::pocPT`, POC_OPENERS);
+}
+
+// ---------------- Parsing / Counting helpers ----------------
+
+function splitSections(text) {
+  const t = String(text || "").trim();
+  
+  // Expect:
+  // Subjective\n
+  // <line>\n
+  // \n
+  // Summary\n
+  // <multi>\n
+  // \n
+  // POC\n
+  // <one line>
+  const re =
+  /^Subjective\s*\n([\s\S]*?)\n\nSummary\s*\n([\s\S]*?)\n\nPOC\s*\n([\s\S]*?)$/;
+  
+  const m = t.match(re);
+  if (!m) return null;
+  
+  const subjective = m[1].trim();
+  const summary = m[2].trim();
+  const poc = m[3].trim();
+  
+  if (!subjective || !summary || !poc) return null;
+  return { subjective, summary, poc };
+}
+
+function countSentences(text) {
+  const t = String(text || "").trim();
+  if (!t) return 0;
+  const parts = t.split(/(?<=[.!?])\s+/).filter(Boolean);
+  return parts.length;
+}
+
+function containsArrows(text) {
+  return /[↑↓]/.test(String(text || ""));
+}
+
+function hasBulletsOrNumbering(text) {
+  const t = String(text || "");
+  return /^\s*[-*•]\s+/m.test(t) || /^\s*\d+\.\s+/m.test(t);
+}
+
+function hasBannedGenericSummaryStart(summary) {
+  const s = String(summary || "").trim().toLowerCase();
+  return (
+          s.startsWith("pt demonstrates good engagement") ||
+          s.startsWith("pt tolerated treatment well") ||
+          s.startsWith("rom showed slight improvement") ||
+          s.startsWith("pain levels remained manageable")
+          );
+}
+
+function normalizeNewlines(text) {
+  return String(text || "")
+  .replace(/\r\n/g, "\n")
+  .replace(/\n{3,}/g, "\n\n")
+  .trim();
+}
+
+// ---------------- Rules ----------------
 
 const SUBJECTIVE_STARTERS = [
   "Pt reports",
-  "Pt noted",
-  "Pt verbalized",
-  "Pt c/c of",
-  "Pt complaints of",
-  "Pt provided consent for tx",
-  "Pt agrees to PT tx and POC",
+  "Pt states",
+  "Pt notes",
+  "Pt c/o",
+  "Pt denies",
+  "Pt agrees",
+  "Pt confirms",
 ];
 
-const BANNED_SUMMARY_STARTS = [
-  "Pt demonstrated good engagement",
-  "Pt tolerated treatment well",
-  "ROM showed slight improvement",
-  "pain levels remained manageable",
-];
-
-function buildGeneratePrompt({ patientLabel, userText, introPrefix, closerSentence, pocOpener }) {
-  // IMPORTANT: keep rules out of the 3-section output by separating constraints cleanly.
+function buildGeneratePrompt({
+  patientLabel,
+  userText,
+  introPrefix,
+  closerSentence,
+  pocOpener,
+  discipline,
+}) {
   return `
-  Write a PT visit note with EXACTLY 3 sections in this order:
-  
-  Subjective
-  (one sentence)
-  
-  Summary
-  (5 to 7 sentences)
-  
-  POC
-  (one line)
-  
-  FORMAT (must follow exactly):
-  - Output must contain ONLY these 3 section headers: Subjective, Summary, POC.
-  - Each header is on its own line (no colon).
-  - Exactly ONE blank line between sections.
-  - No bullets, no numbering, no extra labels.
-  - Never write "patient" or "the patient"; always "Pt".
-  - No arrows (↑ ↓).
-  - Use abbreviations only; do NOT spell out abbreviations.
-  
-  SOURCE OF TRUTH / NO-HALLUCINATION:
-  - Use ONLY the user instruction as factual input.
-  - Do NOT invent: pain scores, distances, devices, vitals, diagnoses, grades, times, frequencies, or side (R/L/B) unless explicitly stated in user instruction.
-  - If instruction is vague, write general-but-accurate statements without adding specifics.
-  
-  SUBJECTIVE RULES:
-  - Subjective must be ONE sentence only.
-  - Must start with exactly ONE of these starters:
-  ${SUBJECTIVE_STARTERS.join(" / ")}
-  - Subjective must be patient-reported content only.
-  - Do NOT add objective findings in Subjective.
-  - Do NOT say "tolerates tx well" in Subjective.
-  
-  SUMMARY RULES:
-  - Summary must be 5 to 7 sentences.
-  - Summary first sentence MUST start with this exact prefix (case-sensitive): "${introPrefix}"
-  - Do NOT use arrows (↑ ↓).
-  - Do NOT start any Summary sentence with these phrases:
-  ${BANNED_SUMMARY_STARTS.map((s) => `"${s}"`).join(", ")}.
-- The FINAL sentence of Summary must be EXACTLY this sentence (copy it verbatim, do not alter):
+Write a ${discipline} visit note with EXACTLY 3 sections in this order:
+
+Subjective
+(one sentence)
+
+Summary
+(5 to 7 sentences)
+
+POC
+(one line)
+
+FORMAT (must follow exactly):
+- Output must contain ONLY these 3 section headers: Subjective, Summary, POC.
+- Each header is on its own line (no colon).
+- Exactly ONE blank line between sections.
+- No bullets or numbering anywhere.
+- Do not output any extra text before Subjective or after POC.
+
+SUBJECTIVE RULES:
+- Exactly ONE sentence.
+- Must be patient-reported only.
+- Must start with one of: ${SUBJECTIVE_STARTERS.join(", ")}.
+- Must NOT say "tolerates tx well" or include objective measures.
+
+SUMMARY RULES:
+- Exactly 5 to 7 sentences.
+- No arrows (↑ ↓).
+- Use abbrev where appropriate.
+- Do NOT start the Summary with generic banned openers (e.g. "Pt tolerated treatment well").
+- FIRST Summary sentence MUST start EXACTLY with this prefix (copy it verbatim):
+  ${introPrefix}
+- LAST Summary sentence MUST be EXACTLY this sentence (copy it verbatim, do not alter):
   ${closerSentence}
 
 POC RULES:
 - POC must be ONE line only.
-- Must start with: "PT POC:"
-- Must use this exact opener immediately after "PT POC:" (do not change): "${pocOpener}"
+- Must start with: "${discipline === "OT" ? "OT POC:" : "PT POC:"}"
+- Must use this exact opener immediately after header (do not change): "${pocOpener}"
 - Must include ALL required elements and end with "to meet goals."
 - Required POC content:
-  TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals.
+  ${
+    discipline === "OT"
+      ? "TherAct, ADL training, functional training, UE function/coordination, safety/energy conservation, injury prevention to meet goals."
+      : "TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals."
+  }
+
+No-hallucination:
+- Only use details explicitly present in user instruction; no new numbers/devices/vitals/diagnoses.
 
 User instruction (only source of truth):
 ${userText}
@@ -289,26 +326,43 @@ ${patientLabel}
 `.trim();
 }
 
-function buildRepairPrompt({ patientLabel, userText, badOutput, introPrefix, closerSentence, pocOpener }) {
+function buildRepairPrompt({
+  patientLabel,
+  userText,
+  badOutput,
+  introPrefix,
+  closerSentence,
+  pocOpener,
+  discipline,
+}) {
   return `
 You must FIX the note to comply with ALL constraints. Do not add facts.
 
-Return ONLY the corrected note with EXACTLY 3 sections: Subjective, Summary, POC.
+Return ONLY the corrected note with EXACTLY 3 sections:
+Subjective
+Summary
+POC
 
 Constraints to enforce:
 - Subjective: ONE sentence, patient-reported only, must start with one of:
-  ${SUBJECTIVE_STARTERS.join(" / ")}
-- Summary: 5 to 7 sentences.
-- Summary first sentence MUST start with: "${introPrefix}"
-- Summary final sentence MUST be EXACTLY: ${closerSentence}
-- No arrows (↑ ↓).
-- Never write "patient"; always "Pt".
-- No bullets or numbering.
-- POC: ONE line, must be:
-  PT POC: ${pocOpener} TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals.
+  ${SUBJECTIVE_STARTERS.join(", ")}
+- Summary: 5-7 sentences, no arrows, no bullets/numbering, first Summary sentence must start with:
+  ${introPrefix}
+- Summary last sentence MUST be exactly:
+  ${closerSentence}
+- POC: ONE line, must be exactly:
+  ${
+    discipline === "OT"
+      ? ("OT POC: " +
+        pocOpener +
+        " TherAct, ADL training, functional training, UE function/coordination, safety/energy conservation, injury prevention to meet goals.")
+      : ("PT POC: " +
+        pocOpener +
+        " TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals.")
+  }
 
 No-hallucination:
-- Only use details explicitly present in user instruction; no new numbers/devices/vitals/diagnoses.
+- Only use details explicitly present in user instruction; no new facts.
 
 User instruction:
 ${userText}
@@ -322,71 +376,103 @@ Now output the corrected note only.
 
 // ---------------- Validation ----------------
 
-function validateGenerated({ text, introPrefix, closerSentence, pocOpener }) {
+function validateGenerated({ text, introPrefix, closerSentence, pocOpener, discipline }) {
   const sections = splitSections(text);
-  if (!sections) return { ok: false, reason: "Could not parse 3 sections (Subjective/Summary/POC) with required spacing." };
+  if (!sections)
+    return {
+      ok: false,
+    reason:
+      "Could not parse 3 sections (Subjective/Summary/POC) with required spacing.",
+    };
   
   const { subjective, summary, poc } = sections;
   
   // Subjective: 1 sentence, allowed starter, no objective-ish "tolerates tx well"
-  if (countSentences(subjective) !== 1) return { ok: false, reason: "Subjective must be exactly 1 sentence." };
+  if (countSentences(subjective) !== 1)
+    return { ok: false, reason: "Subjective must be exactly 1 sentence." };
   
   const starterOk = SUBJECTIVE_STARTERS.some((s) => subjective.startsWith(s));
-  if (!starterOk) return { ok: false, reason: "Subjective must start with an allowed starter." };
+  if (!starterOk)
+    return { ok: false, reason: "Subjective must start with an allowed starter." };
   
-  if (/tolerates?\s+tx\s+well/i.test(subjective)) return { ok: false, reason: 'Subjective must not say "tolerates tx well".' };
+  if (/tolerates?\s+tx\s+well/i.test(subjective))
+    return { ok: false, reason: 'Subjective must not say "tolerates tx well".' };
   
-  // Summary: 5-7 sentences, no arrows, intro prefix, banned openers, final sentence exact
-  const sc = countSentences(summary);
-  if (sc < 5 || sc > 7) return { ok: false, reason: "Summary must be 5–7 sentences." };
-  if (hasArrowChars(summary)) return { ok: false, reason: "Summary contains arrow characters." };
-  if (!summary.startsWith(introPrefix)) return { ok: false, reason: "Summary does not start with required intro prefix." };
+  // Summary: 5-7 sentences, no arrows, intro
+  const sumCount = countSentences(summary);
+  if (sumCount < 5 || sumCount > 7)
+    return { ok: false, reason: "Summary must be 5 to 7 sentences." };
   
-  // Banned starters: check each sentence start
-  const sentences = summary.split(/(?<=[.!?])\s+/).filter(Boolean);
-  for (const s of sentences) {
-    const trimmed = s.trim();
-    if (BANNED_SUMMARY_STARTS.some((b) => trimmed.startsWith(b))) {
-      return { ok: false, reason: "Summary uses a banned generic starter." };
-    }
-  }
+  if (containsArrows(summary))
+    return { ok: false, reason: "Summary must not contain arrows (↑/↓)." };
+  
+  if (hasBulletsOrNumbering(summary))
+    return { ok: false, reason: "Summary must not contain bullets/numbering." };
+  
+  if (hasBannedGenericSummaryStart(summary))
+    return { ok: false, reason: "Summary starts with a banned generic opener." };
+  
+  if (!summary.startsWith(introPrefix))
+    return {
+      ok: false,
+      reason: "First Summary sentence must start with required intro prefix.",
+    };
   
   const last = getLastSentence(summary);
-  if (last !== closerSentence) return { ok: false, reason: "Summary final sentence is not the required exact closing sentence." };
-  if (!includesExactClosingPhrase(last)) return { ok: false, reason: 'Summary final sentence must include: "Continued skilled PT remains indicated"' };
+  if (last !== closerSentence)
+    return { ok: false, reason: "Summary must end with exact required closing sentence." };
   
-  // POC: one line, exact template
-  if (!lineIsSingleLine(poc)) return { ok: false, reason: "POC must be one line." };
-  const expectedPoc = `PT POC: ${pocOpener} TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals.`;
-  if (poc !== expectedPoc) return { ok: false, reason: "POC line does not match required template." };
+  if (!includesExactClosingPhrase(last, discipline))
+    return { ok: false, reason: "Summary must end with required closing phrase." };
   
-  // Global: must not contain the word "patient"
-  if (/\bpatient\b/i.test(text)) return { ok: false, reason: 'Output contains forbidden word "patient".' };
+  // POC must be one line and match expected
+  if (!isSingleLine(poc)) return { ok: false, reason: "POC must be one line." };
+  
+  const expectedPoc =
+  discipline === "OT"
+  ? `OT POC: ${pocOpener} TherAct, ADL training, functional training, UE function/coordination, safety/energy conservation, injury prevention to meet goals.`
+  : `PT POC: ${pocOpener} TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals.`;
+  
+  if (poc !== expectedPoc)
+    return {
+      ok: false,
+      reason: `POC must match exact template.\nExpected: ${expectedPoc}\nGot: ${poc}`,
+    };
   
   return { ok: true };
 }
 
 // ---------------- Routes ----------------
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
 
-app.get("/debug-env", (_req, res) => {
+app.get("/debug-env", (req, res) => {
   res.json({
     ok: true,
-    port: PORT,
     model: MODEL,
-    hasKey: OPENAI_API_KEY.startsWith("sk-"),
-    keyPrefix: OPENAI_API_KEY.slice(0, 7) + "...",
+    keyPresent: OPENAI_API_KEY && OPENAI_API_KEY.startsWith("sk-"),
   });
 });
 
+// Optional helper: clean user input conservatively (not required by your iOS client)
 app.post("/clean", async (req, res) => {
   try {
-    const rawText = String(req.body?.rawText || "");
-    if (!rawText.trim()) return res.status(400).json({ error: "rawText is required." });
+    const raw = String(req.body?.text || "");
+    const locallyCleaned = normalizeSpaces(cleanUserText(raw));
     
-    const locallyCleaned = cleanUserText(rawText);
-    const prompt = buildCleanPrompt(locallyCleaned);
+    // If you want pure local clean, return here:
+    // return res.json({ cleaned: locallyCleaned });
+    
+    const prompt = `Clean this note text conservatively:
+- Remove obvious duplication
+- Normalize spacing
+- Do not add facts
+Return only the cleaned text.
+
+TEXT:
+${locallyCleaned}`.trim();
     
     const completion = await openai.chat.completions.create({
       model: MODEL,
@@ -397,7 +483,8 @@ app.post("/clean", async (req, res) => {
       ],
     });
     
-    const cleaned = completion.choices?.[0]?.message?.content?.trim() || locallyCleaned;
+    const cleaned =
+    completion.choices?.[0]?.message?.content?.trim() || locallyCleaned;
     return res.json({ cleaned: normalizeSpaces(cleaned) });
   } catch (err) {
     console.error("❌ /clean failed");
@@ -417,10 +504,13 @@ app.post("/generate", async (req, res) => {
     
     if (!userText.trim()) return res.status(400).json({ error: "userText is required." });
     
-    // Rotate intro/closer/poc opener server-side (reliably varied)
+    // Discipline (PT/OT) + rotate intro/closer/poc opener server-side (reliably varied)
+    const disciplineRaw = String(req.body?.discipline || "PT").toUpperCase().trim();
+    const discipline = disciplineRaw === "OT" ? "OT" : "PT";
+    
     const introPrefix = pickIntroPrefix(patientLabel);
-    const closerSentence = pickCloser(patientLabel);
-    const pocOpener = pickPocOpener(patientLabel);
+    const closerSentence = pickCloserForDiscipline(patientLabel, discipline);
+    const pocOpener = pickPocOpenerForDiscipline(patientLabel, discipline);
     
     const prompt = buildGeneratePrompt({
       patientLabel,
@@ -428,36 +518,31 @@ app.post("/generate", async (req, res) => {
       introPrefix,
       closerSentence,
       pocOpener,
+      discipline,
     });
     
     const completion = await openai.chat.completions.create({
       model: MODEL,
-      temperature: 0.3,
+      temperature: 0.2,
       messages: [
-        {
-          role: "system",
-        content:
-          "You write concise PT visit notes per strict formatting rules. Use abbreviations. Do not hallucinate.",
-        },
+        { role: "system", content: "Follow formatting rules exactly. Do not add facts. Output only the note." },
         { role: "user", content: prompt },
       ],
     });
     
-    let text = completion.choices?.[0]?.message?.content?.trim() || "";
-    if (!text) return res.status(500).json({ error: "Empty response from model." });
+    let out = normalizeNewlines(completion.choices?.[0]?.message?.content || "");
     
-    text = normalizeSpaces(text);
-    
-    // Validate; if invalid, do one repair pass.
-    const v1 = validateGenerated({ text, introPrefix, closerSentence, pocOpener });
+    // Validate; if fails, attempt one repair pass
+    const v1 = validateGenerated({ text: out, introPrefix, closerSentence, pocOpener, discipline });
     if (!v1.ok) {
       const repairPrompt = buildRepairPrompt({
         patientLabel,
         userText,
-        badOutput: text,
+        badOutput: out,
         introPrefix,
         closerSentence,
         pocOpener,
+        discipline,
       });
       
       const repair = await openai.chat.completions.create({
@@ -469,32 +554,32 @@ app.post("/generate", async (req, res) => {
         ],
       });
       
-      const repaired = normalizeSpaces(repair.choices?.[0]?.message?.content?.trim() || "");
-      if (repaired) text = repaired;
+      const repaired = normalizeNewlines(repair.choices?.[0]?.message?.content || "");
+      const v2 = validateGenerated({ text: repaired, introPrefix, closerSentence, pocOpener, discipline });
       
-      const v2 = validateGenerated({ text, introPrefix, closerSentence, pocOpener });
       if (!v2.ok) {
-        return res.status(500).json({
-          error: "Generation produced invalid format.",
-          details: v2.reason,
-          raw: text,
+        return res.status(422).json({
+          error: "Model output failed validation after repair.",
+          reason1: v1.reason,
+          reason2: v2.reason,
+          raw: repaired || out,
         });
       }
+      
+      return res.json({ summary: repaired });
     }
     
-    return res.json({ summary: text });
+    return res.json({ summary: out });
   } catch (err) {
     console.error("❌ /generate failed");
     console.error(err?.status, err?.message || err);
     return res.status(500).json({
-      error: "Generation failed.",
+      error: "Generate failed.",
       details: err?.message || String(err),
     });
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("PT summary backend running on:");
-  console.log(`- http://localhost:${PORT}`);
-  console.log(`- http://0.0.0.0:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`✅ Server listening on :${PORT}`);
 });
