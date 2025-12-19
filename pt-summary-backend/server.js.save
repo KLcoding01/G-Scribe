@@ -1,0 +1,244 @@
+PORT=3301 npm start
+// server.js
+import express from "express";
+import cors from "cors";
+import OpenAI from "openai";
+import "dotenv/config";
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
+
+// Keep your existing port if you want. (Your iOS app currently points to 3301.)
+const PORT = process.env.PORT || 3301;
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY) {
+  console.error("Missing OPENAI_API_KEY in env.");
+  process.exit(1);
+}
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+/* =========================
+ * VALIDATION HELPERS
+ * =======================*/
+
+function countSentences(text) {
+  const t = (text || "").trim();
+  if (!t) return 0;
+  const matches = t.match(/[^.!?]+[.!?]+/g);
+  if (matches) return matches.length;
+  return 1;
+}
+
+function validateOutput(output) {
+  const warnings = [];
+  const text = String(output || "").replace(/\r\n/g, "\n").trim();
+  if (!text) return { ok: false, warnings: ["Output is empty."] };
+  
+  const lines = text.split("\n");
+  const nonEmpty = lines.filter((l) => l.trim() !== "");
+  
+  const subjRegex = /^Subjective\s*:\s*/i;
+  const summRegex = /^Summary\s*:\s*/i;
+  const pocRegex = /^PT\s*POC\s*:\s*/i;
+  
+  // Must have all 3 sections
+  const hasSubj = nonEmpty.some((l) => subjRegex.test(l.trim()));
+  const hasSumm = nonEmpty.some((l) => summRegex.test(l.trim()));
+  const hasPOC = nonEmpty.some((l) => pocRegex.test(l.trim()));
+  if (!hasSubj) warnings.push("Missing 'Subjective:' line.");
+  if (!hasSumm) warnings.push("Missing 'Summary:' line.");
+  if (!hasPOC) warnings.push("Missing 'PT POC:' line.");
+  
+  // Subjective must be first non-empty line
+  const first = (nonEmpty[0] || "").trim();
+  if (!subjRegex.test(first)) warnings.push("First non-empty line must start with 'Subjective:'.");
+  
+  // PT POC must be last non-empty line
+  const last = (nonEmpty[nonEmpty.length - 1] || "").trim();
+  if (!pocRegex.test(last)) warnings.push("Last non-empty line must start with 'PT POC:'.");
+  
+  // Require blank line after Subjective line (in original lines)
+  const firstNonEmptyIdx = lines.findIndex((l) => l.trim() !== "");
+  if (firstNonEmptyIdx >= 0) {
+    const nextLine = lines[firstNonEmptyIdx + 1];
+    if (typeof nextLine === "string" && nextLine.trim() !== "") {
+      warnings.push("Missing blank line after Subjective line.");
+    }
+  }
+  
+  // Extract summary lines (from Summary: until PT POC)
+  const summaryStartIdx = lines.findIndex((l) => summRegex.test(l.trim()));
+  if (summaryStartIdx === -1) {
+    warnings.push("Cannot locate Summary section.");
+    return { ok: warnings.length === 0, warnings };
+  }
+  
+  const summaryLines = [];
+  for (let i = summaryStartIdx; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    if (pocRegex.test(line.trim())) break;
+    summaryLines.push(line);
+  }
+  
+  if (summaryLines.length > 0) {
+    summaryLines[0] = summaryLines[0].replace(summRegex, "").trim();
+  }
+  
+  const mainSummary = summaryLines.join(" ").replace(/\s{2,}/g, " ").trim();
+  if (!mainSummary) warnings.push("Missing Summary text.");
+  
+  // Summary must be 5–7 sentences
+  const detected = countSentences(mainSummary);
+  if (detected < 5 || detected > 7) {
+    warnings.push(`Summary must be 5–7 sentences: detected ${detected}.`);
+  }
+  
+  // Last Summary sentence must contain exact phrase
+  if (mainSummary) {
+    const lastSentenceMatch = mainSummary.match(/[^.!?]+[.!?]\s*$/);
+    const lastSentence = (lastSentenceMatch ? lastSentenceMatch[0] : mainSummary).toLowerCase();
+    if (!lastSentence.includes("continued skilled pt remains indicated")) {
+      warnings.push('Last Summary sentence must include: "Continued skilled PT remains indicated."');
+    }
+  }
+  
+  // Summary should NOT contain Pt reports/states/verbalizes
+  const banned = /\bPt\s+(reports|reported|states|stated|verbalizes|verbalized)\b/i;
+  if (banned.test(mainSummary)) {
+    warnings.push("Summary contains banned phrasing (Pt reports/states/verbalizes). Put that in Subjective only.");
+  }
+  
+  // Never arrows
+  if (/[↑↓]/.test(text)) {
+    warnings.push("Do not use arrows (↑ ↓).");
+  }
+  
+  return { ok: warnings.length === 0, warnings };
+}
+
+/* =========================
+ * PROMPTS
+ * =======================*/
+
+const SYSTEM_PROMPT = `
+You write PT visit note output blocks.
+
+STRICT OUTPUT FORMAT (MUST MATCH EXACTLY):
+- Exactly 3 sections, in order:
+
+Subjective: <ONE sentence>
+
+Summary: <5–7 sentences. Summary must be objective/assessment/treatment-focused. Do NOT use "Pt reports/states/verbalizes" here. The LAST sentence MUST contain the exact phrase: "Continued skilled PT remains indicated.">
+
+PT POC: <single line, last line, must start with PT POC:>
+
+SPACING:
+- Exactly one blank line after Subjective line.
+- Exactly one blank line after Summary block.
+- PT POC line must be the final non-empty line.
+
+STYLE:
+- Use "Pt" (not "patient" / "the patient").
+- No arrows (↑ ↓).
+- Use PT abbreviations when appropriate (MT, TherEx, TherAct, HEP, ADLs).
+- Match the topic/body region from the user instruction. Do not add unrelated topics.
+`.trim();
+
+function buildUserPrompt({ patientLabel, userText }) {
+  return `
+Context:
+Patient: ${patientLabel}
+User instruction: ${userText}
+
+Write the output in the EXACT required format.
+`.trim();
+}
+
+function buildCorrectionPrompt({ originalOutput, warnings }) {
+  return `
+Your prior output FAILED validation.
+
+Validation warnings:
+- ${warnings.join("\n- ")}
+
+Fix the output to satisfy ALL rules.
+Return ONLY the corrected 3-section output block (no extra commentary).
+Here is your prior output:
+${originalOutput}
+`.trim();
+}
+
+/* =========================
+ * ROUTES
+ * =======================*/
+
+app.post("/generate", async (req, res) => {
+  try {
+    const { patientLabel = "Patient #1", userText = "" } = req.body || {};
+    if (!userText.trim()) {
+      return res.status(400).json({ error: "userText is required." });
+    }
+    
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+    
+    // 1) First attempt
+    const prompt = buildUserPrompt({ patientLabel, userText });
+    
+    const completion1 = await openai.chat.completions.create({
+      model,
+      temperature: 0.4,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: prompt }
+      ]
+    });
+    
+    let text = completion1.choices?.[0]?.message?.content?.trim() || "";
+    
+    // 2) Validate and optionally do one correction pass
+    let v = validateOutput(text);
+    if (!v.ok) {
+      const correctionPrompt = buildCorrectionPrompt({
+        originalOutput: text,
+        warnings: v.warnings
+      });
+      
+      const completion2 = await openai.chat.completions.create({
+        model,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: prompt },
+          { role: "assistant", content: text },
+          { role: "user", content: correctionPrompt }
+        ]
+      });
+      
+      text = completion2.choices?.[0]?.message?.content?.trim() || text;
+      
+      // Validate again; if still fails, return with soft warning (but keep API response stable)
+      v = validateOutput(text);
+      if (!v.ok) {
+        // Still return the best attempt (so the app doesn't break),
+        // but include warnings for debugging (you can remove this later).
+        return res.json({ summary: text, warnings: v.warnings });
+      }
+    }
+    
+    return res.json({ summary: text });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Generation failed." });
+  }
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`PT summary backend running on:`);
+  console.log(`- http://localhost:${PORT}`);
+  console.log(`- http://0.0.0.0:${PORT}`);
+});
