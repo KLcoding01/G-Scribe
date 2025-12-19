@@ -1,0 +1,142 @@
+:root {
+  --bg: #ffffff;
+  --card: #ffffff;
+  --text: #111827;        /* near-black */
+  --muted: #4b5563;       /* gray-600 */
+  --border: #d1d5db;      /* gray-300 */
+  --accent: #2563eb;      /* blue-600 */
+  --danger: #dc2626;      /* red-600 */
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.wrap {
+  max-width: 980px;
+  margin: 24px auto;
+  padding: 0 16px;
+}
+
+header h1 { margin: 0 0 6px; font-size: 28px; }
+header .sub { margin: 0 0 18px; color: var(--muted); }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 10px 0 6px;
+}
+
+textarea {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: #ffffff;
+  color: var(--text);
+  outline: none;
+  line-height: 1.35;
+}
+
+textarea::placeholder {
+  color: #9ca3af; /* gray-400 */
+}
+
+select {
+  width: 100%;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: #ffffff;
+  color: var(--text);
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  align-items: end;
+  margin-top: 10px;
+}
+
+.col { flex: 1; }
+.actions { display: flex; justify-content: flex-end; }
+
+button {
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #ffffff;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+button.secondary {
+  background: #ffffff;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.status {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.outputHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.outputHeader h2 { margin: 0; font-size: 18px; }
+.outputHeader .btns { display: flex; gap: 8px; }
+
+.output {
+  margin: 12px 0 0;
+  padding: 14px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  white-space: pre-wrap;
+  line-height: 1.4;
+  min-height: 140px;
+  color: var(--text);
+}
+
+.warnings {
+  margin-top: 10px;
+  color: #b45309; /* amber-700 */
+  font-size: 13px;
+}
+
+footer { color: var(--muted); text-align: center; margin-top: 10px; }
+
+/* ---------------------------------------------------
+ Hide OpenAI API Key section (input + save row)
+ --------------------------------------------------- */
+.apiRow,
+.apiMeta {
+  display: none !important;
+}

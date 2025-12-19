@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Kelvin PT Note Bot</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Kelvin PT Note Bot</h1>
+      <p class="sub">Revise PT notes strictly per your changes (Medicare-compliant format).</p>
+    </header>
+
+    <section class="card">
+      <label>Original Note</label>
+      <textarea id="originalNote" placeholder="Paste the original note here..."></textarea>
+
+      <label>Requested Changes</label>
+      <textarea id="changes" placeholder="Describe exactly what to change (no new findings unless you state them)..."></textarea>
+
+      <div class="row">
+        <div class="col">
+          <label>Main Summary Sentences</label>
+          <select id="sentenceTarget">
+            <option value="5">5</option>
+            <option value="6" selected>6</option>
+            <option value="7">7</option>
+          </select>
+        </div>
+        <div class="col actions">
+          <button id="generateBtn">Generate Revised Note</button>
+        </div>
+      </div>
+
+      <div id="status" class="status"></div>
+    </section>
+
+    <section class="card">
+      <div class="outputHeader">
+        <h2>Output</h2>
+        <div class="btns">
+          <button id="copyBtn" class="secondary">Copy</button>
+          <button id="clearBtn" class="secondary">Clear</button>
+        </div>
+      </div>
+      <pre id="output" class="output"></pre>
+      <div id="warnings" class="warnings"></div>
+    </section>
+
+    <footer>
+      <small>Local tool. Avoid storing PHI in logs. Set OPENAI_API_KEY in .env.</small>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
