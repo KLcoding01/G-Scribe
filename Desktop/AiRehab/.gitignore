@@ -1,0 +1,6 @@
+.DS_Store
+**/.DS_Store
+node_modules/
+pt-summary-backend/node_modules/
+pt-summary-backend/.env
+.env
