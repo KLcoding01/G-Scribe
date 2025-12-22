@@ -17,11 +17,16 @@ import OpenAI from "openai";
 import dotenv from "dotenv";
 
 import { PT_TEMPLATES, OT_TEMPLATES } from "./templates.js";
+import aiRouter from "./aisummary.js";
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+
+// AI eval routes (aisummary.js)
+app.use("/api/ai", aiRouter);
+app.use("/", aiRouter);
 
 const PORT = Number(process.env.PORT || 3301);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";

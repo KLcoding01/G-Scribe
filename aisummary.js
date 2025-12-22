@@ -20,8 +20,8 @@
 //  OPENAI_MODEL (optional, default gpt-4o-mini)
 //  AI_API_KEY (optional, if you enable header auth below)
 
-const express = require("express");
-const OpenAI = require("openai");
+import express from "express";
+import OpenAI from "openai";
 
 const router = express.Router();
 
@@ -427,4 +427,4 @@ Long-Term Goals (13–25 visits):
   }
 });
 
-module.exports = router;
+export default router;
