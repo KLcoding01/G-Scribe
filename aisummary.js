@@ -28,7 +28,10 @@ const router = express.Router();
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
+// --------------------------------------------------
 // Optional header auth
+// --------------------------------------------------
+
 const REQUIRE_API_KEY = !!process.env.AI_API_KEY;
 const AI_API_KEY = process.env.AI_API_KEY || "";
 
@@ -60,8 +63,8 @@ function safeStr(v) {
 }
 
 /**
- * 🔧 NEW: Global dictation lead-in stripping
- * Applied to ALL text fields before prompt assembly
+ * Strip dictation lead-ins globally
+ * Ensures PMH / meds / dx dictation transfers cleanly
  */
 function normalizeDictation(text) {
   let t = safeStr(text);
@@ -82,7 +85,7 @@ function normalizeDictation(text) {
 }
 
 /**
- * 🔧 NEW: Normalize ALL incoming fields once
+ * Normalize all incoming fields once
  */
 function normalizeFields(fields = {}) {
   const out = {};
@@ -94,25 +97,28 @@ function normalizeFields(fields = {}) {
 
 function computeAge(dobRaw, fallbackAge = "X") {
   const dob = safeStr(dobRaw);
-  if (!dob) return safeStr(fallbackAge) || "X";
+  if (!dob) return fallbackAge;
   
-  const tryParse = (s) => {
-    let m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
-    m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-    if (m) return new Date(+m[3], +m[1] - 1, +m[2]);
-    m = s.match(/^(\d{2})-(\d{2})-(\d{4})$/);
-    if (m) return new Date(+m[3], +m[1] - 1, +m[2]);
-    return null;
-  };
+  let m =
+  dob.match(/^(\d{4})-(\d{2})-(\d{2})$/) ||
+  dob.match(/^(\d{2})\/(\d{2})\/(\d{4})$/) ||
+  dob.match(/^(\d{2})-(\d{2})-(\d{4})$/);
   
-  const dobDt = tryParse(dob);
-  if (!dobDt || Number.isNaN(dobDt.getTime())) return safeStr(fallbackAge) || "X";
+  if (!m) return fallbackAge;
+  
+  const year = +m[3];
+  const month = +m[1] - 1;
+  const day = +m[2];
+  const dt = new Date(year, month, day);
   
   const today = new Date();
-  let age = today.getFullYear() - dobDt.getFullYear();
-  const m = today.getMonth() - dobDt.getMonth();
-  if (m < 0 || (m === 0 && today.getDate() < dobDt.getDate())) age -= 1;
+  let age = today.getFullYear() - dt.getFullYear();
+  if (
+      today.getMonth() < dt.getMonth() ||
+      (today.getMonth() === dt.getMonth() && today.getDate() < dt.getDate())
+      ) {
+        age--;
+      }
   return String(age);
 }
 
@@ -129,36 +135,22 @@ function buildPainLine(f) {
     ["Relieved", "pain_relieved"],
     ["Interferes", "pain_interferes"],
   ];
+  
   return pairs
   .map(([lbl, key]) => `${lbl}: ${safeStr(f[key])}`)
   .filter((s) => !s.endsWith(":"))
   .join("; ");
 }
 
-// --- SOAP AUTO-BUILD (FROM OBJECTIVE DATA IF SOAP NOT EXPLICIT) ---
-if (!patch.soapPainLine && patch.painLocation) {
-  patch.soapPainLine = `${patch.painLocation}${patch.painRating ? ": " + patch.painRating : ""}`;
-}
-
-if (!patch.soapRom && patch.rom) {
-  patch.soapRom = patch.rom;
-}
-
-if (!patch.soapPalpation && patch.palpation) {
-  patch.soapPalpation = patch.palpation;
-}
-
-if (!patch.soapFunctional && patch.functional) {
-  patch.soapFunctional = patch.functional;
-}
 /**
- * 🔧 NEW: SOAP Assessment builder (mirrors Python export logic)
+ * SOAP Assessment builder
+ * Mirrors Python export format exactly
  */
 function buildSoapAssessment(f) {
   return (
           "Soap Assessment:\n\n" +
-          "Pain:\n" +
-          `${safeStr(f.pain_location)}\n${safeStr(f.pain_rating)}\n\n` +
+          "Pain Location:\n" +
+          `${safeStr(f.pain_location)}${f.pain_rating ? ": " + f.pain_rating : ""}\n\n` +
           "ROM:\n" +
           `${safeStr(f.rom)}\n\n` +
           "Palpation:\n" +
@@ -171,7 +163,7 @@ function buildSoapAssessment(f) {
 }
 
 async function gptCall(prompt, maxTokens = 500) {
-  if (!openai) throw new Error("OPENAI_API_KEY not configured on server.");
+  if (!openai) throw new Error("OPENAI_API_KEY not configured.");
   
   const resp = await openai.chat.completions.create({
     model: MODEL,
@@ -179,7 +171,7 @@ async function gptCall(prompt, maxTokens = 500) {
       {
         role: "system",
       content:
-        "You are a clinical documentation assistant for rehab clinicians. Follow instructions exactly. Keep output clean and compliant.",
+        "You are a clinical documentation assistant for rehab clinicians. Use abbreviations only. Never say 'the patient'. Be Medicare compliant.",
       },
       { role: "user", content: prompt },
     ],
@@ -190,10 +182,9 @@ async function gptCall(prompt, maxTokens = 500) {
   return resp.choices?.[0]?.message?.content?.trim() || "";
 }
 
-function jsonError(res, status, msg, extra = {}) {
-  return res.status(status).json({ error: msg, ...extra });
+function jsonError(res, status, msg, detail) {
+  return res.status(status).json({ error: msg, detail });
 }
-
 // --------------------------------------------------
 // PT ROUTES
 // --------------------------------------------------
@@ -205,20 +196,23 @@ router.post("/pt_generate_diffdx", async (req, res) => {
     
     const prompt =
     "You are a PT clinical assistant. Based on the following evaluation details, " +
-    "provide a concise statement of the most clinically-associated PT differential diagnosis. " +
-    "Do NOT state as fact or as a medical diagnosis—use only language such as 'symptoms and clinical findings are associated with or consistent with' the diagnosis.\n\n" +
+    "provide a concise PT differential diagnosis. " +
+    "Do NOT state as fact or as a medical diagnosis—use language such as " +
+    "'symptoms and clinical findings are consistent with or associated with'.\n\n" +
     `Subjective:\n${f.subjective}\n\n` +
     `Pain:\n${pain}\n\n` +
-    `Objective:\nPosture: ${f.posture}\nROM: ${f.rom}\nStrength: ${f.strength}`;
+    `Objective:\nROM: ${f.rom}\nStrength: ${f.strength}\nPosture: ${f.posture}`;
     
     const result = await gptCall(prompt, 250);
     return res.json({ result });
   } catch (e) {
-    return jsonError(res, 500, "pt_generate_diffdx failed", {
-      detail: String(e?.message || e),
-    });
+    return jsonError(res, 500, "pt_generate_diffdx failed", e?.message || e);
   }
 });
+
+// --------------------------------------------------
+// PT SUMMARY
+// --------------------------------------------------
 
 router.post("/pt_generate_summary", async (req, res) => {
   try {
@@ -235,126 +229,111 @@ router.post("/pt_generate_summary", async (req, res) => {
     const age = computeAge(f.dob, f.age);
     const gender = (f.gender || "patient").toLowerCase();
     const pmh = f.history || "no significant history";
+    const meds = f.meds || "N/A";
     const today = f.currentdate || new Date().toLocaleDateString("en-US");
     
     let prompt = "";
     
     if (summaryType === "Evaluation") {
       prompt =
-      "Generate a concise, 7-8 sentence Physical Therapy assessment summary that is Medicare compliant. " +
-      "Use only abbreviations. Never use 'the patient'.\n" +
-      `Start with: "${name}, a ${age} y/o ${gender} with relevant history of ${pmh}."\n` +
+      "Generate a concise 7–8 sentence Physical Therapy assessment summary that is Medicare compliant. " +
+      "Use abbreviations only. Never use 'the patient' or third-person pronouns.\n" +
+      `Start with: "${name}, a ${age} y/o ${gender} with PMH of ${pmh}."\n` +
       `Include PT eval on ${today} for ${f.subjective}. ` +
-      `Symptoms are associated with referring dx ${f.meddiag} and PT diff dx ${f.diffdx}. ` +
-      `Summarize impairments (strength: ${f.strength}; ROM: ${f.rom}). ` +
+      `Medications: ${meds}. ` +
+      `Symptoms are associated with referring dx ${f.meddiag}. ` +
+      `Summarize impairments (ROM: ${f.rom}; strength: ${f.strength}). ` +
       `Summarize functional limitations: ${f.functional}. ` +
-      "End stating skilled PT is medically necessary to return to PLOF.";
+      "End stating continued skilled PT is medically necessary to return to PLOF.";
     }
     
     const narrative = await gptCall(prompt, 500);
     const soap = buildSoapAssessment(f);
     
-    return res.json({ result: `${narrative}\n\n${soap}` });
-  } catch (e) {
-    return jsonError(res, 500, "pt_generate_summary failed", {
-      detail: String(e?.message || e),
+    return res.json({
+      result: `${narrative}\n\n${soap}`,
     });
+  } catch (e) {
+    return jsonError(res, 500, "pt_generate_summary failed", e?.message || e);
   }
 });
 
 // --------------------------------------------------
-// PT: Goals
+// PT GOALS
 // --------------------------------------------------
 
 router.post("/pt_generate_goals", async (req, res) => {
   try {
     const f = normalizeFields(req.body?.fields || {});
     
-    const summary = safeStr(f.summary);
-    const strength = safeStr(f.strength);
-    const rom = safeStr(f.rom);
-    const impairments = safeStr(f.impairments);
-    const functional = safeStr(f.functional);
-    const meddiag = safeStr(f.meddiag);
-    const painLocation = safeStr(f.pain_location);
-    
     const prompt = `
-You are a clinical assistant helping a PT write documentation.
-Below is a summary of the patient's evaluation and findings:
-Diagnosis/Region: ${meddiag || painLocation}
-Summary: ${summary}
-Strength: ${strength}
-ROM: ${rom}
-Impairments: ${impairments}
-Functional Limitations: ${functional}
+You are a clinical assistant helping a Physical Therapist write documentation.
 
-Using ONLY the above provided eval info, generate clinically-appropriate, Medicare-compliant short-term and long-term PT goals for the region/problem described.
-Each goal must be functionally focused and follow this EXACT format, time frame, and language example (do NOT copy example content, use it as a style guide):
+Diagnosis/Region: ${f.meddiag || f.pain_location}
+Strength: ${f.strength}
+ROM: ${f.rom}
+Impairments: ${f.impairments}
+Functional Limitations: ${f.functional}
+
+Using ONLY the above provided evaluation info, generate Medicare-compliant PT goals.
+ALWAYS follow this EXACT format. Do NOT add or remove any sections.
 
 Short-Term Goals (1–12 visits):
-1. Pt will report [symptom] ≤[target]/10 with [functional activity].
-2. Pt will improve [objective finding] by ≥[measurable target] to allow [activity].
-3. Pt will demonstrate ≥[percent]% adherence to [strategy/technique] during [ADL].
-4. Pt will perform HEP, transfer, or mobility with [level of independence] to support [function].
+1. Pt will report pain ≤[target]/10 during [functional activity].
+2. Pt will improve [objective finding] by ≥[measurable amount] to allow [activity].
+3. Pt will demonstrate ≥[percent]% adherence to HEP during ADLs.
+4. Pt will perform transfers or mobility with [level of independence] to support function.
 
 Long-Term Goals (13–25 visits):
-1. Pt will increase [strength or ability] by ≥[amount] to support safe [ADL/task].
-2. Pt will restore [ROM/ability] to within [target] of normal, enabling [activity].
-3. Pt will demonstrate 100% adherence to [technique/precaution] during [ADL/IADL].
-4. Pt will independently perform [home program or self-management] to maintain function and prevent recurrence.
-
-ALWAYS use this structure, always begin each statement with 'Pt will', and do NOT add any extra text.
+1. Pt will increase strength or functional capacity to safely perform ADLs.
+2. Pt will restore ROM to within functional limits to enable daily activities.
+3. Pt will demonstrate independence with HEP to prevent reinjury.
+4. Pt will resume PLOF with minimal or no symptoms.
 `.trim();
     
     const result = await gptCall(prompt, 400);
     return res.json({ result });
   } catch (e) {
-    return jsonError(res, 500, "pt_generate_goals failed", {
-      detail: String(e?.message || e),
-    });
+    return jsonError(res, 500, "pt_generate_goals failed", e?.message || e);
   }
 });
-
 // --------------------------------------------------
-// OT: Differential Dx
+// PT ROUTES
 // --------------------------------------------------
 
-router.post("/ot_generate_diffdx", async (req, res) => {
+router.post("/pt_generate_diffdx", async (req, res) => {
   try {
     const f = normalizeFields(req.body?.fields || {});
-    let dx = safeStr(f.diffdx);
+    const pain = buildPainLine(f);
     
-    if (!dx) {
-      const pain = buildPainLine(f);
-      const dxPrompt =
-      "You are an OT clinical assistant. Based on the following OT evaluation details, " +
-      "provide a concise statement of the most clinically-associated OT differential diagnosis. " +
-      "Do NOT state as fact or as a medical diagnosis—use only language such as " +
-      "'symptoms and clinical findings are associated with or consistent with' the diagnosis.\n\n" +
-      `Subjective:\n${f.subjective}\n\nPain:\n${pain}`;
-      
-      dx = await gptCall(dxPrompt, 200);
-    }
+    const prompt =
+    "You are a PT clinical assistant. Based on the following evaluation details, " +
+    "provide a concise PT differential diagnosis. " +
+    "Do NOT state as fact or as a medical diagnosis—use language such as " +
+    "'symptoms and clinical findings are consistent with or associated with'.\n\n" +
+    `Subjective:\n${f.subjective}\n\n` +
+    `Pain:\n${pain}\n\n` +
+    `Objective:\nROM: ${f.rom}\nStrength: ${f.strength}\nPosture: ${f.posture}`;
     
-    return res.json({ result: dx });
+    const result = await gptCall(prompt, 250);
+    return res.json({ result });
   } catch (e) {
-    return jsonError(res, 500, "ot_generate_diffdx failed", {
-      detail: String(e?.message || e),
-    });
+    return jsonError(res, 500, "pt_generate_diffdx failed", e?.message || e);
   }
 });
 
 // --------------------------------------------------
-// OT: Summary
+// PT SUMMARY
 // --------------------------------------------------
 
-router.post("/ot_generate_summary", async (req, res) => {
+router.post("/pt_generate_summary", async (req, res) => {
   try {
     const f = normalizeFields(req.body?.fields || {});
+    const summaryType = safeStr(req.body?.summary_type || "Evaluation");
     
     const name =
     f.name ||
-    f.ot_patient_name ||
+    f.pt_patient_name ||
     f.patient_name ||
     f.full_name ||
     "Pt";
@@ -362,54 +341,76 @@ router.post("/ot_generate_summary", async (req, res) => {
     const age = computeAge(f.dob, f.age);
     const gender = (f.gender || "patient").toLowerCase();
     const pmh = f.history || "no significant history";
+    const meds = f.meds || "N/A";
     const today = f.currentdate || new Date().toLocaleDateString("en-US");
-    const subj = f.subjective;
-    const moi = f.pain_mechanism;
-    const meddiag = f.meddiag || f.medical_diagnosis;
     
-    let dx = safeStr(f.diffdx);
-    if (!dx) {
-      const pain = buildPainLine(f);
-      const dxPrompt =
-      "You are an OT clinical assistant. Based on the following OT evaluation details, " +
-      "provide a concise statement of the most clinically-associated OT differential diagnosis. " +
-      "Do NOT state as fact or as a medical diagnosis—use only language such as " +
-      "'symptoms and clinical findings are associated with or consistent with' the diagnosis.\n\n" +
-      `Subjective:\n${subj}\n\nPain:\n${pain}`;
-      
-      dx = await gptCall(dxPrompt, 200);
+    let prompt = "";
+    
+    if (summaryType === "Evaluation") {
+      prompt =
+      "Generate a concise 7–8 sentence Physical Therapy assessment summary that is Medicare compliant. " +
+      "Use abbreviations only. Never use 'the patient' or third-person pronouns.\n" +
+      `Start with: "${name}, a ${age} y/o ${gender} with PMH of ${pmh}."\n` +
+      `Include PT eval on ${today} for ${f.subjective}. ` +
+      `Medications: ${meds}. ` +
+      `Symptoms are associated with referring dx ${f.meddiag}. ` +
+      `Summarize impairments (ROM: ${f.rom}; strength: ${f.strength}). ` +
+      `Summarize functional limitations: ${f.functional}. ` +
+      "End stating continued skilled PT is medically necessary to return to PLOF.";
     }
-    
-    const strg = f.strength;
-    const rom = f.rom;
-    const impair = f.impairments;
-    const func = f.functional;
-    
-    const prompt =
-    "Generate a concise, 7-8 sentence Occupational Therapy assessment summary that is Medicare compliant. " +
-    "Use only abbreviations (e.g., HEP, ADLs, IADLs, STM, TherEx). Never use 'the patient'. " +
-    "Do NOT use parentheses, asterisks, or markdown formatting.\n" +
-    `Start with: "${name}, a ${age} y/o ${gender} with relevant history of ${pmh}."\n` +
-    `Include OT eval on ${today} for ${subj}. ` +
-    (moi ? `Mention MOI: ${moi}. ` : "") +
-    `State symptoms are associated with referring dx ${meddiag} and OT diff dx ${dx}. ` +
-    `Summarize impairments (strength: ${strg}; ROM: ${rom}). ` +
-    `Summarize functional limitations: ${func}. ` +
-    "End stating skilled OT is medically necessary to return to PLOF.";
     
     const narrative = await gptCall(prompt, 500);
     const soap = buildSoapAssessment(f);
     
-    return res.json({ result: `${narrative}\n\n${soap}` });
-  } catch (e) {
-    return jsonError(res, 500, "ot_generate_summary failed", {
-      detail: String(e?.message || e),
+    return res.json({
+      result: `${narrative}\n\n${soap}`,
     });
+  } catch (e) {
+    return jsonError(res, 500, "pt_generate_summary failed", e?.message || e);
   }
 });
 
 // --------------------------------------------------
-// OT: Goals
+// PT GOALS
+// --------------------------------------------------
+
+router.post("/pt_generate_goals", async (req, res) => {
+  try {
+    const f = normalizeFields(req.body?.fields || {});
+    
+    const prompt = `
+You are a clinical assistant helping a Physical Therapist write documentation.
+
+Diagnosis/Region: ${f.meddiag || f.pain_location}
+Strength: ${f.strength}
+ROM: ${f.rom}
+Impairments: ${f.impairments}
+Functional Limitations: ${f.functional}
+
+Using ONLY the above provided evaluation info, generate Medicare-compliant PT goals.
+ALWAYS follow this EXACT format. Do NOT add or remove any sections.
+
+Short-Term Goals (1–12 visits):
+1. Pt will report pain ≤[target]/10 during [functional activity].
+2. Pt will improve [objective finding] by ≥[measurable amount] to allow [activity].
+3. Pt will demonstrate ≥[percent]% adherence to HEP during ADLs.
+4. Pt will perform transfers or mobility with [level of independence] to support function.
+
+Long-Term Goals (13–25 visits):
+1. Pt will increase strength or functional capacity to safely perform ADLs.
+2. Pt will restore ROM to within functional limits to enable daily activities.
+3. Pt will demonstrate independence with HEP to prevent reinjury.
+4. Pt will resume PLOF with minimal or no symptoms.
+`.trim();
+    
+    const result = await gptCall(prompt, 400);
+    return res.json({ result });
+  } catch (e) {
+    return jsonError(res, 500, "pt_generate_goals failed", e?.message || e);
+  }
+});
+// --------------------------------------------------
+// OT GOALS
 // --------------------------------------------------
 
 router.post("/ot_generate_goals", async (req, res) => {
@@ -417,38 +418,54 @@ router.post("/ot_generate_goals", async (req, res) => {
     const f = normalizeFields(req.body?.fields || {});
     
     const summary =
-    f.summary ||
-    "Pt evaluated for functional deficits impacting ADLs/IADLs.";
-    const strength = f.strength || "N/A";
-    const rom = f.rom || "N/A";
-    const impairments = f.impairments || "N/A";
-    const functional = f.functional || "N/A";
+    safeStr(f.summary) ||
+    "Pt evaluated for functional deficits impacting ADLs and IADLs.";
+    
+    const strength = safeStr(f.strength) || "N/A";
+    const rom = safeStr(f.rom) || "N/A";
+    const impairments = safeStr(f.impairments) || "N/A";
+    const functional = safeStr(f.functional) || "N/A";
+    const pain = safeStr(f.pain_location) || "N/A";
     
     const prompt = `
 You are a clinical assistant helping an occupational therapist write documentation.
-Below is a summary of the patient's evaluation and findings:
-Summary: ${summary}
-Strength: ${strength}
-ROM: ${rom}
-Impairments: ${impairments}
-Functional Limitations: ${functional}
 
-Using ONLY the above provided eval info, generate clinically-appropriate, Medicare-compliant short-term and long-term OT goals.
+Below is the patient's evaluation data. Use ONLY this information.
+Do NOT invent details. Do NOT use third-person pronouns.
+Always begin each goal with "Pt will".
 
-ALWAYS follow this exact format—do not add, skip, reorder, or alter any lines or labels.
-Output ONLY this structure:
+Evaluation Summary:
+${summary}
+
+Pain:
+${pain}
+
+ROM:
+${rom}
+
+Strength:
+${strength}
+
+Impairments:
+${impairments}
+
+Functional Limitations:
+${functional}
+
+Generate Medicare-compliant OT goals using EXACTLY the following structure.
+Do NOT add or remove sections or lines.
 
 Short-Term Goals (1–12 visits):
-1. Pt will [specific ADL/IADL task] with [level of assistance/adaptive strategy].
-2. Pt will improve [ROM/strength/endurance] by [amount or %] to support [task].
-3. Pt will independently use [adaptive equipment] during [ADL/IADL].
-4. Pt will report pain ≤[target]/10 during [functional task].
+1. Pt will perform [specific ADL/IADL] with [level of assistance or AE] to improve functional independence.
+2. Pt will improve [ROM/strength/endurance] by [measurable amount] to support safe task performance.
+3. Pt will demonstrate improved activity tolerance during [task] with appropriate pacing or strategy use.
+4. Pt will report pain ≤[target]/10 during completion of [functional task].
 
 Long-Term Goals (13–25 visits):
-1. Pt will complete all ADLs/IADLs independently or with AE as needed.
-2. Pt will demonstrate safe performance of [home/community task].
-3. Pt will participate in [activity] with [level of independence].
-4. Pt will independently implement learned strategies to maintain function.
+1. Pt will independently perform ADLs/IADLs using learned strategies or AE as needed.
+2. Pt will demonstrate safe completion of [home/community task] without increased symptoms.
+3. Pt will tolerate ≥[time] of functional activity to support daily routines.
+4. Pt will independently manage HEP and compensatory strategies to maintain functional gains.
 `.trim();
     
     const result = await gptCall(prompt, 400);
@@ -459,5 +476,9 @@ Long-Term Goals (13–25 visits):
     });
   }
 });
+
+// --------------------------------------------------
+// EXPORT ROUTER
+// --------------------------------------------------
 
 export default router;
