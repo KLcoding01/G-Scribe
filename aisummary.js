@@ -135,6 +135,22 @@ function buildPainLine(f) {
   .join("; ");
 }
 
+// --- SOAP AUTO-BUILD (FROM OBJECTIVE DATA IF SOAP NOT EXPLICIT) ---
+if (!patch.soapPainLine && patch.painLocation) {
+  patch.soapPainLine = `${patch.painLocation}${patch.painRating ? ": " + patch.painRating : ""}`;
+}
+
+if (!patch.soapRom && patch.rom) {
+  patch.soapRom = patch.rom;
+}
+
+if (!patch.soapPalpation && patch.palpation) {
+  patch.soapPalpation = patch.palpation;
+}
+
+if (!patch.soapFunctional && patch.functional) {
+  patch.soapFunctional = patch.functional;
+}
 /**
  * 🔧 NEW: SOAP Assessment builder (mirrors Python export logic)
  */

@@ -675,12 +675,27 @@ app.post("/eval/extract", async (req, res) => {
       currentForm,
       transcript,
       routingRules: [
+        // --- CORE ---
         "If pain details are mentioned, map to painLocation/painRating/painAggravating/painRelieved/painInterferes.",
-        "If mobility/ADL limits are mentioned, map to functional or impairments.",
-        "If ROM or strength measurements are mentioned, map to rom/strength.",
+        "If mobility/ADL limits (stairs, transfers, gait, STS) are mentioned, map to functional or impairments.",
+        "If measurements are stated (ROM, strength), map to rom/strength.",
         "If palpation/tenderness is mentioned, map to palpation.",
-        "If goals or frequency are mentioned, map to goals/frequency.",
-        "If unsure, omit.",
+        "If the dictation includes goals or frequency, map to goals/frequency.",
+        
+        // --- SOAP AWARENESS ---
+        "If the transcript contains 'Soap Assessment' or 'SOAP', extract SOAP content separately.",
+        "If SOAP pain is described, map to soapPainLine.",
+        "If SOAP ROM is described, map to soapRom.",
+        "If SOAP palpation is described, map to soapPalpation.",
+        "If SOAP functional tests are described, map to soapFunctional.",
+        
+        // --- CLEAN MEDICAL LANGUAGE ---
+        "If text starts with 'past medical history', strip the phrase and keep only diagnoses.",
+        "If text starts with 'medical history', strip the phrase and keep only diagnoses.",
+        "If medications are mentioned, extract only medication names into meds.",
+        "Do not include narrative phrases like 'past medical history consists of'.",
+        
+        "If unsure, omit."
       ],
     };
     
