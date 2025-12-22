@@ -18,21 +18,23 @@ import dotenv from "dotenv";
 
 import { PT_TEMPLATES, OT_TEMPLATES } from "./templates.js";
 import aiRouter from "./aisummary.js";
+
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// AI eval routes (aisummary.js)
+// ---------------- AI eval routes (aisummary.js) ----------------
 app.use("/api/ai", aiRouter);
 app.use("/", aiRouter);
 
+// ---------------- Config ----------------
 const PORT = Number(process.env.PORT || 3301);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// Basic sanity logging (does not print full key)
+// ---------------- Sanity logging ----------------
 console.log("Booting PT/OT summary backend...");
 console.log("PORT =", PORT);
 console.log("MODEL =", MODEL);
@@ -99,8 +101,7 @@ function cleanUserText(rawText) {
     out.push(line);
   }
   
-  // Keep it reasonable
-  return out.joined ? out.joined("\n") : out.join("\n");
+  return out.join("\n");
 }
 
 // ---------------- Patient-based rotation (stable variations) ----------------
@@ -185,7 +186,6 @@ function pickPocOpenerForDiscipline(patientLabel, discipline) {
   ? pickForPatient(`${patientLabel}::pocOT`, OT_POC_OPENERS)
   : pickForPatient(`${patientLabel}::pocPT`, POC_OPENERS);
 }
-
 // ---------------- Parsing / Counting helpers ----------------
 
 function splitSections(text) {
@@ -250,7 +250,6 @@ function normalizeNewlines(text) {
 // NEW: Ban "The patient" and third-person pronouns in SUMMARY
 function hasBannedThirdPersonRef(text) {
   const t = String(text || "");
-  // whole-word matches; case-insensitive
   return /\b(the patient|they|their|them|theirs|themselves)\b/i.test(t);
 }
 
@@ -383,7 +382,6 @@ ${badOutput}
 Now output the corrected note only.
 `.trim();
 }
-
 // ---------------- Validation ----------------
 
 function validateGenerated({
@@ -407,7 +405,9 @@ function validateGenerated({
   if (countSentences(subjective) !== 1)
     return { ok: false, reason: "Subjective must be exactly 1 sentence." };
   
-  const starterOk = SUBJECTIVE_STARTERS.some((s) => subjective.startsWith(s));
+  const starterOk = SUBJECTIVE_STARTERS.some((s) =>
+                                             subjective.startsWith(s)
+                                             );
   if (!starterOk)
     return {
       ok: false,
@@ -415,18 +415,27 @@ function validateGenerated({
     };
   
   if (/tolerates?\s+tx\s+well/i.test(subjective))
-    return { ok: false, reason: 'Subjective must not say "tolerates tx well".' };
+    return {
+      ok: false,
+      reason: 'Subjective must not say "tolerates tx well".',
+    };
   
-  // Summary: 5-7 sentences, no arrows, no bullets, no banned pronouns, intro + exact closer
+  // Summary: 5–7 sentences, no arrows, no bullets, no banned pronouns, intro + exact closer
   const sumCount = countSentences(summary);
   if (sumCount < 5 || sumCount > 7)
     return { ok: false, reason: "Summary must be 5 to 7 sentences." };
   
   if (containsArrows(summary))
-    return { ok: false, reason: "Summary must not contain arrows (↑/↓)." };
+    return {
+      ok: false,
+      reason: "Summary must not contain arrows (↑/↓).",
+    };
   
   if (hasBulletsOrNumbering(summary))
-    return { ok: false, reason: "Summary must not contain bullets/numbering." };
+    return {
+      ok: false,
+      reason: "Summary must not contain bullets or numbering.",
+    };
   
   if (hasBannedThirdPersonRef(summary))
     return {
@@ -436,7 +445,10 @@ function validateGenerated({
     };
   
   if (hasBannedGenericSummaryStart(summary))
-    return { ok: false, reason: "Summary starts with a banned generic opener." };
+    return {
+      ok: false,
+      reason: "Summary starts with a banned generic opener.",
+    };
   
   if (!summary.startsWith(introPrefix))
     return {
@@ -452,10 +464,14 @@ function validateGenerated({
     };
   
   if (!includesExactClosingPhrase(last, discipline))
-    return { ok: false, reason: "Summary must end with required closing phrase." };
+    return {
+      ok: false,
+      reason: "Summary must end with required closing phrase.",
+    };
   
   // POC must be one line and match expected
-  if (!isSingleLine(poc)) return { ok: false, reason: "POC must be one line." };
+  if (!isSingleLine(poc))
+    return { ok: false, reason: "POC must be one line." };
   
   const expectedPoc =
   discipline === "OT"
@@ -556,18 +572,22 @@ app.get("/debug-env", (req, res) => {
 app.get("/eval/templates", (req, res) => {
   const discipline = normalizeDiscipline(req.query?.discipline);
   const templates = getTemplatesForDiscipline(discipline);
-  const names = Object.keys(templates || {}).sort((a, b) => a.localeCompare(b));
+  const names = Object.keys(templates || {}).sort((a, b) =>
+                                                  a.localeCompare(b)
+                                                  );
   return res.json({ templates: names.map((name) => ({ name })) });
 });
 
 app.get("/eval/template", (req, res) => {
   const discipline = normalizeDiscipline(req.query?.discipline);
   const name = String(req.query?.name || "").trim();
-  if (!name) return res.status(400).json({ error: "name is required." });
+  if (!name)
+    return res.status(400).json({ error: "name is required." });
   
   const templates = getTemplatesForDiscipline(discipline);
   const t = templates?.[name];
-  if (!t) return res.status(404).json({ error: `Template not found: ${name}` });
+  if (!t)
+    return res.status(404).json({ error: `Template not found: ${name}` });
   
   return res.json({ template: mapTemplateToSwiftPayload(t) });
 });
@@ -576,30 +596,67 @@ app.post("/eval/extract", async (req, res) => {
   try {
     const discipline = normalizeDiscipline(req.body?.discipline);
     const templateName = String(req.body?.templateName || "").trim();
-    const transcript = normalizeSpaces(String(req.body?.transcript || ""));
+    const transcript = normalizeSpaces(
+                                       String(req.body?.transcript || "")
+                                       );
     const currentForm = req.body?.currentForm || {};
     const mergeMode = String(req.body?.mergeMode || "fill_empty");
     
     if (!transcript.trim())
-      return res.status(400).json({ error: "transcript is required." });
+      return res
+      .status(400)
+      .json({ error: "transcript is required." });
     
     // Allowed patch keys = Swift EvalFormPatch keys (camelCase)
     const allowedKeys = [
-      "gender","dob","weight","height","bmi","bmiCategory",
-      "meddiag","history","subjective",
-      "painLocation","painOnset","painCondition","painMechanism","painRating","painFrequency",
-      "painDescription","painAggravating","painRelieved","painInterferes","tests","dme","plof",
-      "posture","rom","strength","palpation","functional","special","impairments",
-      "assessmentSummary","goals","frequency","intervention","procedures",
-      "soapPainLine","soapRom","soapPalpation","soapFunctional"
+      "gender",
+      "dob",
+      "weight",
+      "height",
+      "bmi",
+      "bmiCategory",
+      "meddiag",
+      "history",
+      "subjective",
+      "painLocation",
+      "painOnset",
+      "painCondition",
+      "painMechanism",
+      "painRating",
+      "painFrequency",
+      "painDescription",
+      "painAggravating",
+      "painRelieved",
+      "painInterferes",
+      "tests",
+      "dme",
+      "plof",
+      "posture",
+      "rom",
+      "strength",
+      "palpation",
+      "functional",
+      "special",
+      "impairments",
+      "assessmentSummary",
+      "goals",
+      "frequency",
+      "intervention",
+      "procedures",
+      "soapPainLine",
+      "soapRom",
+      "soapPalpation",
+      "soapFunctional",
     ];
     
-    // Provide template context if selected (helps the model stay "on topic")
+    // Provide template context if selected
     let templatePayload = null;
     if (templateName) {
       const templates = getTemplatesForDiscipline(discipline);
       if (templates?.[templateName]) {
-        templatePayload = mapTemplateToSwiftPayload(templates[templateName]);
+        templatePayload = mapTemplateToSwiftPayload(
+                                                    templates[templateName]
+                                                    );
       }
     }
     
@@ -607,8 +664,7 @@ app.post("/eval/extract", async (req, res) => {
     "You are a clinical documentation extraction engine for PT/OT evaluations. " +
     "Read a free-form dictation transcript and return ONLY JSON. " +
     "Do NOT invent facts. Do NOT output any prose. " +
-    "Return: {\"patch\":{...}} where patch contains only allowed keys that are explicitly stated or clearly implied. " +
-    "Use PT-style abbreviations where appropriate and always use 'Pt' (never 'the patient').";
+    'Use PT-style abbreviations and always use "Pt".';
     
     const user = {
       discipline,
@@ -620,12 +676,12 @@ app.post("/eval/extract", async (req, res) => {
       transcript,
       routingRules: [
         "If pain details are mentioned, map to painLocation/painRating/painAggravating/painRelieved/painInterferes.",
-        "If mobility/ADL limits (stairs, transfers, gait, STS) are mentioned, map to functional or impairments.",
-        "If measurements are stated (ROM, strength), map to rom/strength.",
+        "If mobility/ADL limits are mentioned, map to functional or impairments.",
+        "If ROM or strength measurements are mentioned, map to rom/strength.",
         "If palpation/tenderness is mentioned, map to palpation.",
-        "If the dictation includes goals or frequency, map to goals/frequency.",
-        "If unsure, omit."
-      ]
+        "If goals or frequency are mentioned, map to goals/frequency.",
+        "If unsure, omit.",
+      ],
     };
     
     const completion = await openai.chat.completions.create({
@@ -633,44 +689,31 @@ app.post("/eval/extract", async (req, res) => {
       temperature: 0.1,
       messages: [
         { role: "system", content: system },
-        { role: "user", content: JSON.stringify(user) }
+        { role: "user", content: JSON.stringify(user) },
       ],
-      response_format: { type: "json_object" }
+      response_format: { type: "json_object" },
     });
     
     const raw = completion.choices?.[0]?.message?.content || "";
     let obj = safeJsonParse(raw);
     
     if (!obj || typeof obj !== "object") {
-      const repair = await openai.chat.completions.create({
-        model: MODEL,
-        temperature: 0.1,
-        messages: [
-          { role: "system", content: "Return ONLY valid JSON. No prose." },
-          { role: "user", content: "Fix this into valid JSON with top-level key 'patch' only:\n\n" + raw }
-        ],
-        response_format: { type: "json_object" }
-      });
-      const raw2 = repair.choices?.[0]?.message?.content || "";
-      obj = safeJsonParse(raw2);
-      if (!obj) {
-        return res.status(422).json({ error: "Model did not return valid JSON.", raw: raw2 || raw });
-      }
+      return res
+      .status(422)
+      .json({ error: "Model did not return valid JSON.", raw });
     }
     
     const patch = stripPatchToAllowedKeys(obj.patch, allowedKeys);
     return res.json({ patch, debug: obj.debug || [] });
   } catch (err) {
     console.error("❌ /eval/extract failed");
-    console.error(err?.status, err?.message || err);
+    console.error(err);
     return res.status(500).json({
       error: "Eval extract failed.",
       details: err?.message || String(err),
     });
   }
 });
-
-
 // Optional helper: clean user input conservatively (not required by your iOS client)
 app.post("/clean", async (req, res) => {
   try {
@@ -701,7 +744,10 @@ ${locallyCleaned}`.trim();
       ],
     });
     
-    const cleaned = completion.choices?.[0]?.message?.content?.trim() || locallyCleaned;
+    const cleaned =
+    completion.choices?.[0]?.message?.content?.trim() ||
+    locallyCleaned;
+    
     return res.json({ cleaned: normalizeSpaces(cleaned) });
   } catch (err) {
     console.error("❌ /clean failed");
@@ -716,22 +762,29 @@ ${locallyCleaned}`.trim();
 app.post("/generate", async (req, res) => {
   try {
     const patientLabel =
-    String(req.body?.patientLabel || "Patient #1").trim() || "Patient #1";
+    String(req.body?.patientLabel || "Patient #1").trim() ||
+    "Patient #1";
     const userTextRaw = String(req.body?.userText || "");
     const userText = normalizeSpaces(userTextRaw);
     
     if (!userText.trim())
       return res.status(400).json({ error: "userText is required." });
     
-    // Discipline (PT/OT) + rotate intro/closer/poc opener server-side (reliably varied)
+    // Discipline (PT/OT)
     const disciplineRaw = String(req.body?.discipline || "PT")
     .toUpperCase()
     .trim();
     const discipline = disciplineRaw === "OT" ? "OT" : "PT";
     
     const introPrefix = pickIntroPrefix(patientLabel);
-    const closerSentence = pickCloserForDiscipline(patientLabel, discipline);
-    const pocOpener = pickPocOpenerForDiscipline(patientLabel, discipline);
+    const closerSentence = pickCloserForDiscipline(
+                                                   patientLabel,
+                                                   discipline
+                                                   );
+    const pocOpener = pickPocOpenerForDiscipline(
+                                                 patientLabel,
+                                                 discipline
+                                                 );
     
     const prompt = buildGeneratePrompt({
       patientLabel,
@@ -755,7 +808,9 @@ app.post("/generate", async (req, res) => {
       ],
     });
     
-    let out = normalizeNewlines(completion.choices?.[0]?.message?.content || "");
+    let out = normalizeNewlines(
+                                completion.choices?.[0]?.message?.content || ""
+                                );
     
     // Validate; if fails, attempt one repair pass
     const v1 = validateGenerated({
@@ -790,7 +845,10 @@ app.post("/generate", async (req, res) => {
         ],
       });
       
-      const repaired = normalizeNewlines(repair.choices?.[0]?.message?.content || "");
+      const repaired = normalizeNewlines(
+                                         repair.choices?.[0]?.message?.content || ""
+                                         );
+      
       const v2 = validateGenerated({
         text: repaired,
         introPrefix,
