@@ -9,6 +9,7 @@
 //     "Continued skilled PT remains indicated"  (PT)
 //     "Continued skilled OT remains indicated"  (OT)
 // - POC is one line and must be exact discipline-specific template
+// - NEW RULE: Summary MUST NOT contain: "The patient", they/their/them/theirs/themselves
 
 import express from "express";
 import cors from "cors";
@@ -167,14 +168,6 @@ function pickIntroPrefix(patientLabel) {
   return pickForPatient(`${patientLabel}::intro`, SUMMARY_INTRO_PREFIXES);
 }
 
-function pickCloser(patientLabel) {
-  return pickForPatient(`${patientLabel}::closePT`, SUMMARY_CLOSERS);
-}
-
-function pickPocOpener(patientLabel) {
-  return pickForPatient(`${patientLabel}::pocPT`, POC_OPENERS);
-}
-
 function pickCloserForDiscipline(patientLabel, discipline) {
   return discipline === "OT"
   ? pickForPatient(`${patientLabel}::closeOT`, OT_SUMMARY_CLOSERS)
@@ -248,6 +241,13 @@ function normalizeNewlines(text) {
   .trim();
 }
 
+// NEW: Ban "The patient" and third-person pronouns in SUMMARY
+function hasBannedThirdPersonRef(text) {
+  const t = String(text || "");
+  // whole-word matches; case-insensitive
+  return /\b(the patient|they|their|them|theirs|themselves)\b/i.test(t);
+}
+
 // ---------------- Rules ----------------
 
 const SUBJECTIVE_STARTERS = [
@@ -295,6 +295,8 @@ SUBJECTIVE RULES:
 
 SUMMARY RULES:
 - Exactly 5 to 7 sentences.
+- Do NOT write "The patient" or any third-person pronouns: they/their/them/theirs/themselves (case-insensitive).
+- Refer to the person only as "Pt" (never they/their).
 - No arrows (↑ ↓).
 - Use abbrev where appropriate.
 - Do NOT start the Summary with generic banned openers (e.g. "Pt tolerated treatment well").
@@ -346,19 +348,21 @@ POC
 Constraints to enforce:
 - Subjective: ONE sentence, patient-reported only, must start with one of:
   ${SUBJECTIVE_STARTERS.join(", ")}
-- Summary: 5-7 sentences, no arrows, no bullets/numbering, first Summary sentence must start with:
+- Summary: 5-7 sentences, no arrows, no bullets/numbering.
+- Summary: must NOT contain "The patient" or they/their/them/theirs/themselves (case-insensitive). Use "Pt" only.
+- Summary first sentence must start with:
   ${introPrefix}
 - Summary last sentence MUST be exactly:
   ${closerSentence}
 - POC: ONE line, must be exactly:
   ${
     discipline === "OT"
-      ? ("OT POC: " +
+      ? "OT POC: " +
         pocOpener +
-        " TherAct, ADL training, functional training, UE function/coordination, safety/energy conservation, injury prevention to meet goals.")
-      : ("PT POC: " +
+        " TherAct, ADL training, functional training, UE function/coordination, safety/energy conservation, injury prevention to meet goals."
+      : "PT POC: " +
         pocOpener +
-        " TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals.")
+        " TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals."
   }
 
 No-hallucination:
@@ -376,7 +380,13 @@ Now output the corrected note only.
 
 // ---------------- Validation ----------------
 
-function validateGenerated({ text, introPrefix, closerSentence, pocOpener, discipline }) {
+function validateGenerated({
+  text,
+  introPrefix,
+  closerSentence,
+  pocOpener,
+  discipline,
+}) {
   const sections = splitSections(text);
   if (!sections)
     return {
@@ -393,12 +403,15 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
   
   const starterOk = SUBJECTIVE_STARTERS.some((s) => subjective.startsWith(s));
   if (!starterOk)
-    return { ok: false, reason: "Subjective must start with an allowed starter." };
+    return {
+      ok: false,
+      reason: "Subjective must start with an allowed starter.",
+    };
   
   if (/tolerates?\s+tx\s+well/i.test(subjective))
     return { ok: false, reason: 'Subjective must not say "tolerates tx well".' };
   
-  // Summary: 5-7 sentences, no arrows, intro
+  // Summary: 5-7 sentences, no arrows, no bullets, no banned pronouns, intro + exact closer
   const sumCount = countSentences(summary);
   if (sumCount < 5 || sumCount > 7)
     return { ok: false, reason: "Summary must be 5 to 7 sentences." };
@@ -408,6 +421,13 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
   
   if (hasBulletsOrNumbering(summary))
     return { ok: false, reason: "Summary must not contain bullets/numbering." };
+  
+  if (hasBannedThirdPersonRef(summary))
+    return {
+      ok: false,
+    reason:
+      'Summary must not contain "The patient" or third-person pronouns (they/their/them/theirs/themselves). Use "Pt" only.',
+    };
   
   if (hasBannedGenericSummaryStart(summary))
     return { ok: false, reason: "Summary starts with a banned generic opener." };
@@ -420,7 +440,10 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
   
   const last = getLastSentence(summary);
   if (last !== closerSentence)
-    return { ok: false, reason: "Summary must end with exact required closing sentence." };
+    return {
+      ok: false,
+      reason: "Summary must end with exact required closing sentence.",
+    };
   
   if (!includesExactClosingPhrase(last, discipline))
     return { ok: false, reason: "Summary must end with required closing phrase." };
@@ -478,13 +501,15 @@ ${locallyCleaned}`.trim();
       model: MODEL,
       temperature: 0.15,
       messages: [
-        { role: "system", content: "You rewrite text conservatively without adding facts." },
+        {
+          role: "system",
+          content: "You rewrite text conservatively without adding facts.",
+        },
         { role: "user", content: prompt },
       ],
     });
     
-    const cleaned =
-    completion.choices?.[0]?.message?.content?.trim() || locallyCleaned;
+    const cleaned = completion.choices?.[0]?.message?.content?.trim() || locallyCleaned;
     return res.json({ cleaned: normalizeSpaces(cleaned) });
   } catch (err) {
     console.error("❌ /clean failed");
@@ -498,14 +523,18 @@ ${locallyCleaned}`.trim();
 
 app.post("/generate", async (req, res) => {
   try {
-    const patientLabel = String(req.body?.patientLabel || "Patient #1").trim() || "Patient #1";
+    const patientLabel =
+    String(req.body?.patientLabel || "Patient #1").trim() || "Patient #1";
     const userTextRaw = String(req.body?.userText || "");
     const userText = normalizeSpaces(userTextRaw);
     
-    if (!userText.trim()) return res.status(400).json({ error: "userText is required." });
+    if (!userText.trim())
+      return res.status(400).json({ error: "userText is required." });
     
     // Discipline (PT/OT) + rotate intro/closer/poc opener server-side (reliably varied)
-    const disciplineRaw = String(req.body?.discipline || "PT").toUpperCase().trim();
+    const disciplineRaw = String(req.body?.discipline || "PT")
+    .toUpperCase()
+    .trim();
     const discipline = disciplineRaw === "OT" ? "OT" : "PT";
     
     const introPrefix = pickIntroPrefix(patientLabel);
@@ -525,7 +554,11 @@ app.post("/generate", async (req, res) => {
       model: MODEL,
       temperature: 0.2,
       messages: [
-        { role: "system", content: "Follow formatting rules exactly. Do not add facts. Output only the note." },
+        {
+          role: "system",
+        content:
+          "Follow formatting rules exactly. Do not add facts. Output only the note.",
+        },
         { role: "user", content: prompt },
       ],
     });
@@ -533,7 +566,14 @@ app.post("/generate", async (req, res) => {
     let out = normalizeNewlines(completion.choices?.[0]?.message?.content || "");
     
     // Validate; if fails, attempt one repair pass
-    const v1 = validateGenerated({ text: out, introPrefix, closerSentence, pocOpener, discipline });
+    const v1 = validateGenerated({
+      text: out,
+      introPrefix,
+      closerSentence,
+      pocOpener,
+      discipline,
+    });
+    
     if (!v1.ok) {
       const repairPrompt = buildRepairPrompt({
         patientLabel,
@@ -549,13 +589,23 @@ app.post("/generate", async (req, res) => {
         model: MODEL,
         temperature: 0.2,
         messages: [
-          { role: "system", content: "Fix formatting strictly. Do not add facts. Output only the corrected note." },
+          {
+            role: "system",
+          content:
+            "Fix formatting strictly. Do not add facts. Output only the corrected note.",
+          },
           { role: "user", content: repairPrompt },
         ],
       });
       
       const repaired = normalizeNewlines(repair.choices?.[0]?.message?.content || "");
-      const v2 = validateGenerated({ text: repaired, introPrefix, closerSentence, pocOpener, discipline });
+      const v2 = validateGenerated({
+        text: repaired,
+        introPrefix,
+        closerSentence,
+        pocOpener,
+        discipline,
+      });
       
       if (!v2.ok) {
         return res.status(422).json({
