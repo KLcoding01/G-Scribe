@@ -16,6 +16,7 @@ import cors from "cors";
 import OpenAI from "openai";
 import dotenv from "dotenv";
 
+import { PT_TEMPLATES, OT_TEMPLATES } from "./templates.js";
 dotenv.config();
 
 const app = express();
@@ -465,6 +466,68 @@ function validateGenerated({
   return { ok: true };
 }
 
+// ---------------- Evaluation templates (PT/OT Eval Builder) ----------------
+
+function normalizeDiscipline(d) {
+  const s = String(d || "PT").toUpperCase().trim();
+  return s === "OT" ? "OT" : "PT";
+}
+
+function getTemplatesForDiscipline(discipline) {
+  return discipline === "OT" ? OT_TEMPLATES : PT_TEMPLATES;
+}
+
+// Map snake_case keys (from templates) to camelCase keys (Swift expects)
+const TEMPLATE_KEYMAP = {
+  bmi_category: "bmiCategory",
+  pain_location: "painLocation",
+  pain_onset: "painOnset",
+  pain_condition: "painCondition",
+  pain_mechanism: "painMechanism",
+  pain_rating: "painRating",
+  pain_frequency: "painFrequency",
+  pain_description: "painDescription",
+  pain_aggravating: "painAggravating",
+  pain_relieved: "painRelieved",
+  pain_interferes: "painInterferes",
+};
+
+// Also allow templates that already use camelCase
+function mapTemplateToSwiftPayload(templateObj) {
+  const out = {};
+  for (const [k, v] of Object.entries(templateObj || {})) {
+    const kk = TEMPLATE_KEYMAP[k] || k;
+    out[kk] = v;
+  }
+  return out;
+}
+
+// Safe JSON parse: try direct; if it fails, try to extract the first {...} block
+function safeJsonParse(s) {
+  const raw = String(s || "").trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {}
+  const m = raw.match(/\{[\s\S]*\}$/);
+  if (m) {
+    try {
+      return JSON.parse(m[0]);
+    } catch {}
+  }
+  return null;
+}
+
+function stripPatchToAllowedKeys(patch, allowedKeys) {
+  const out = {};
+  if (!patch || typeof patch !== "object") return out;
+  for (const k of allowedKeys) {
+    const v = patch[k];
+    if (typeof v === "string" && v.trim()) out[k] = v.trim();
+  }
+  return out;
+}
+
 // ---------------- Routes ----------------
 
 app.get("/health", (req, res) => {
@@ -478,6 +541,130 @@ app.get("/debug-env", (req, res) => {
     keyPresent: OPENAI_API_KEY && OPENAI_API_KEY.startsWith("sk-"),
   });
 });
+
+// ---------- Eval Template Catalog (for iOS EvaluationView) ----------
+//
+// GET  /eval/templates?discipline=PT   -> { templates: [{name}] }
+// GET  /eval/template?discipline=PT&name=... -> { template: { ...fields... } }
+// POST /eval/extract  -> { patch: { ...only fields found... } }
+//
+app.get("/eval/templates", (req, res) => {
+  const discipline = normalizeDiscipline(req.query?.discipline);
+  const templates = getTemplatesForDiscipline(discipline);
+  const names = Object.keys(templates || {}).sort((a, b) => a.localeCompare(b));
+  return res.json({ templates: names.map((name) => ({ name })) });
+});
+
+app.get("/eval/template", (req, res) => {
+  const discipline = normalizeDiscipline(req.query?.discipline);
+  const name = String(req.query?.name || "").trim();
+  if (!name) return res.status(400).json({ error: "name is required." });
+  
+  const templates = getTemplatesForDiscipline(discipline);
+  const t = templates?.[name];
+  if (!t) return res.status(404).json({ error: `Template not found: ${name}` });
+  
+  return res.json({ template: mapTemplateToSwiftPayload(t) });
+});
+
+app.post("/eval/extract", async (req, res) => {
+  try {
+    const discipline = normalizeDiscipline(req.body?.discipline);
+    const templateName = String(req.body?.templateName || "").trim();
+    const transcript = normalizeSpaces(String(req.body?.transcript || ""));
+    const currentForm = req.body?.currentForm || {};
+    const mergeMode = String(req.body?.mergeMode || "fill_empty");
+    
+    if (!transcript.trim())
+      return res.status(400).json({ error: "transcript is required." });
+    
+    // Allowed patch keys = Swift EvalFormPatch keys (camelCase)
+    const allowedKeys = [
+      "gender","dob","weight","height","bmi","bmiCategory",
+      "meddiag","history","subjective",
+      "painLocation","painOnset","painCondition","painMechanism","painRating","painFrequency",
+      "painDescription","painAggravating","painRelieved","painInterferes","tests","dme","plof",
+      "posture","rom","strength","palpation","functional","special","impairments",
+      "assessmentSummary","goals","frequency","intervention","procedures",
+      "soapPainLine","soapRom","soapPalpation","soapFunctional"
+    ];
+    
+    // Provide template context if selected (helps the model stay "on topic")
+    let templatePayload = null;
+    if (templateName) {
+      const templates = getTemplatesForDiscipline(discipline);
+      if (templates?.[templateName]) {
+        templatePayload = mapTemplateToSwiftPayload(templates[templateName]);
+      }
+    }
+    
+    const system =
+    "You are a clinical documentation extraction engine for PT/OT evaluations. " +
+    "Read a free-form dictation transcript and return ONLY JSON. " +
+    "Do NOT invent facts. Do NOT output any prose. " +
+    "Return: {\"patch\":{...}} where patch contains only allowed keys that are explicitly stated or clearly implied. " +
+    "Use PT-style abbreviations where appropriate and always use 'Pt' (never 'the patient').";
+    
+    const user = {
+      discipline,
+      mergeMode,
+      allowedKeys,
+      templateName: templateName || null,
+      templateBaseline: templatePayload,
+      currentForm,
+      transcript,
+      routingRules: [
+        "If pain details are mentioned, map to painLocation/painRating/painAggravating/painRelieved/painInterferes.",
+        "If mobility/ADL limits (stairs, transfers, gait, STS) are mentioned, map to functional or impairments.",
+        "If measurements are stated (ROM, strength), map to rom/strength.",
+        "If palpation/tenderness is mentioned, map to palpation.",
+        "If the dictation includes goals or frequency, map to goals/frequency.",
+        "If unsure, omit."
+      ]
+    };
+    
+    const completion = await openai.chat.completions.create({
+      model: MODEL,
+      temperature: 0.1,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify(user) }
+      ],
+      response_format: { type: "json_object" }
+    });
+    
+    const raw = completion.choices?.[0]?.message?.content || "";
+    let obj = safeJsonParse(raw);
+    
+    if (!obj || typeof obj !== "object") {
+      const repair = await openai.chat.completions.create({
+        model: MODEL,
+        temperature: 0.1,
+        messages: [
+          { role: "system", content: "Return ONLY valid JSON. No prose." },
+          { role: "user", content: "Fix this into valid JSON with top-level key 'patch' only:\n\n" + raw }
+        ],
+        response_format: { type: "json_object" }
+      });
+      const raw2 = repair.choices?.[0]?.message?.content || "";
+      obj = safeJsonParse(raw2);
+      if (!obj) {
+        return res.status(422).json({ error: "Model did not return valid JSON.", raw: raw2 || raw });
+      }
+    }
+    
+    const patch = stripPatchToAllowedKeys(obj.patch, allowedKeys);
+    return res.json({ patch, debug: obj.debug || [] });
+  } catch (err) {
+    console.error("❌ /eval/extract failed");
+    console.error(err?.status, err?.message || err);
+    return res.status(500).json({
+      error: "Eval extract failed.",
+      details: err?.message || String(err),
+    });
+  }
+});
+
 
 // Optional helper: clean user input conservatively (not required by your iOS client)
 app.post("/clean", async (req, res) => {
