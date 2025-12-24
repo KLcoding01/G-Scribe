@@ -988,16 +988,6 @@ async function handlePTGoals(req, res) {
   }
 }
 
-// ---- Legacy paths (root) ----
-app.post("/pt_generate_diffdx", handlePTDiffDx);
-app.post("/pt_generate_summary", handlePTSummary);
-app.post("/pt_generate_goals", handlePTGoals);
-
-// ---- Aliases under /api/ai for iOS candidatePaths ----
-app.post("/api/ai/pt_generate_diffdx", handlePTDiffDx);
-app.post("/api/ai/pt_generate_summary", handlePTSummary);
-app.post("/api/ai/pt_generate_goals", handlePTGoals);
-
 // -------------------------------------------------------------------
 // Listen
 // -------------------------------------------------------------------
