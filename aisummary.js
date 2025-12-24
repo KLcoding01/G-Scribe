@@ -1,4 +1,3 @@
-// ======================= aisummary.js (PART 1/2) =======================
 // Express routes for PT/OT diffdx, summary, goals
 //
 // Endpoints (POST):
@@ -13,7 +12,7 @@
 //  { fields: { ... }, summary_type?: "Evaluation"|"Progress Note"|"Discharge" }
 //
 // Response JSON:
-//  { result: "..." }
+//  { result: "..." , region?: "..." }
 //
 // ENV:
 //  OPENAI_API_KEY (required)
@@ -61,10 +60,7 @@ function safeStr(v) {
 }
 
 function normalizeNewlines(s) {
-  return safeStr(s)
-  .replace(/\r\n/g, "\n")
-  .replace(/\n{3,}/g, "\n\n")
-  .trim();
+  return safeStr(s).replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function hasBannedThirdPersonRef(text) {
@@ -78,9 +74,17 @@ function containsArrows(text) {
   return /[↑↓]/.test(String(text || ""));
 }
 
-function hasBulletsOrNumbering(text) {
+/**
+ * Some outputs (GOALS) MUST include numbered lines. Others must not.
+ * - allowNumbered: permits "1. ..." patterns
+ */
+function hasBulletsOrNumbering(text, { allowNumbered = false } = {}) {
   const t = String(text || "");
-  return /^\s*[-*•]\s+/m.test(t) || /^\s*\d+\.\s+/m.test(t);
+  const hasBullets = /^\s*[-*•]\s+/m.test(t);
+  const hasNumbered = /^\s*\d+\.\s+/m.test(t);
+  if (hasBullets) return true;
+  if (hasNumbered && !allowNumbered) return true;
+  return false;
 }
 
 /**
@@ -130,7 +134,12 @@ function normalizeFields(fields = {}) {
     ["meddiag", "meddiag"], // keep
     ["history", "history"],
     ["subjective", "subjective"],
+    ["summary", "summary"],
     ["meds", "meds"],
+    ["impairments", "impairments"],
+    ["functional", "functional"],
+    ["rom", "rom"],
+    ["strength", "strength"],
   ];
   
   for (const [snake, camel] of aliasPairs) {
@@ -155,8 +164,6 @@ function computeAge(dobRaw, fallbackAge = "X") {
   
   if (!m) return fallbackAge;
   
-  // If yyyy-mm-dd: m[1]=yyyy, m[2]=mm, m[3]=dd
-  // If mm/dd/yyyy or mm-dd-yyyy: m[1]=mm, m[2]=dd, m[3]=yyyy
   const isISO = /^\d{4}-/.test(dob);
   const year = isISO ? +m[1] : +m[3];
   const month = (isISO ? +m[2] : +m[1]) - 1;
@@ -176,7 +183,6 @@ function computeAge(dobRaw, fallbackAge = "X") {
 }
 
 function buildPainLine(f) {
-  // supports snake + camel
   const pairs = [
     ["Area/Location", f.pain_location || f.painLocation],
     ["Onset", f.pain_onset || f.painOnset],
@@ -212,11 +218,7 @@ function buildPainLine(f) {
 function buildSoapAssessment(f) {
   const painLoc = safeStr(f.pain_location || f.painLocation);
   const painRating = safeStr(f.pain_rating || f.painRating);
-  const painLine = painLoc
-  ? painRating
-  ? `${painLoc}: ${painRating}`
-  : painLoc
-  : "N/A";
+  const painLine = painLoc ? (painRating ? `${painLoc}: ${painRating}` : painLoc) : "N/A";
   
   return normalizeNewlines(
                            [
@@ -240,7 +242,7 @@ function buildSoapAssessment(f) {
                            );
 }
 
-async function gptCall(prompt, maxTokens = 500) {
+async function gptCall(prompt, maxTokens = 500, temperature = 0.2) {
   if (!openai) throw new Error("OPENAI_API_KEY not configured.");
   
   const resp = await openai.chat.completions.create({
@@ -251,11 +253,12 @@ async function gptCall(prompt, maxTokens = 500) {
       content:
         "You are a clinical documentation assistant for rehab clinicians. " +
         "Use abbreviations where appropriate. Always refer to the person as 'Pt' (never 'the patient' or they/their). " +
-        "No bullets/numbering. No arrows (↑ ↓). Medicare-compliant. Do not invent facts.",
+        "No bullets unless explicitly required by the user prompt. No arrows (↑ ↓). " +
+        "Medicare-compliant. Do not invent facts. Use ONLY provided information.",
       },
       { role: "user", content: prompt },
     ],
-    temperature: 0.2,
+    temperature,
     max_tokens: maxTokens,
   });
   
@@ -266,19 +269,23 @@ async function enforceCleanOutputOrRepair({
   text,
   purpose,
   maxTokens = 350,
+  allowNumbered = false,
 }) {
   const raw = safeStr(text);
   if (!raw) return raw;
   
   const violates =
-  hasBannedThirdPersonRef(raw) || containsArrows(raw) || hasBulletsOrNumbering(raw);
+  hasBannedThirdPersonRef(raw) ||
+  containsArrows(raw) ||
+  hasBulletsOrNumbering(raw, { allowNumbered });
   
   if (!violates) return raw;
   
   const repairPrompt = `
 Fix this ${purpose} text to comply:
 - Use "Pt" only. Do NOT use "the patient" or they/their/them/theirs/themselves.
-- No bullets/numbering
+- No bullets
+- ${allowNumbered ? "Numbered lines are allowed only if already present and required." : "No numbering"}
 - No arrows (↑ ↓)
 - Do not add facts
 Return corrected text only.
@@ -287,7 +294,7 @@ Bad text:
 ${raw}
 `.trim();
   
-  const repaired = await gptCall(repairPrompt, maxTokens);
+  const repaired = await gptCall(repairPrompt, maxTokens, 0.2);
   return safeStr(repaired) || raw;
 }
 
@@ -301,303 +308,365 @@ function normalizeSummaryType(x) {
   if (s.includes("discharge")) return "Discharge";
   return "Evaluation";
 }
-// ======================= aisummary.js (PART 2/2) =======================
 
 // --------------------------------------------------
-// PT ROUTES
+// Region detection + banks (PT + OT)
 // --------------------------------------------------
 
-router.post("/pt_generate_diffdx", async (req, res) => {
-  try {
-    const f = normalizeFields(req.body?.fields || {});
-    const pain = buildPainLine(f);
-    
-    const prompt =
-    "You are a PT clinical assistant. Based on the evaluation details below, " +
-    "provide a concise PT differential diagnosis (3–6 items) in ONE paragraph separated by semicolons. " +
-    "Do NOT state as confirmed diagnosis; use language such as 'findings are consistent with / suggestive of'. " +
-    "No bullets.\n\n" +
-    `Subjective:\n${safeStr(f.subjective) || "N/A"}\n\n` +
-    `Pain:\n${pain || "N/A"}\n\n` +
-    `Objective:\nROM: ${safeStr(f.rom) || "N/A"}\nStrength: ${safeStr(f.strength) || "N/A"}\nPosture: ${safeStr(f.posture) || "N/A"}\n` +
-    `Functional: ${safeStr(f.functional) || "N/A"}\n`;
-    
-    const draft = await gptCall(prompt, 280);
-    const result = await enforceCleanOutputOrRepair({
-      text: draft,
-      purpose: "PT differential dx",
-      maxTokens: 220,
-    });
-    
-    return res.json({ result });
-  } catch (e) {
-    return jsonError(res, 500, "pt_generate_diffdx failed", e?.message || e);
-  }
-});
+function detectPTRegion(f) {
+  const src = [
+    f.meddiag,
+    f.pain_location,
+    f.painLocation,
+    f.region,
+    f.body_region,
+    f.bodyRegion,
+  ]
+  .filter(Boolean)
+  .join(" ")
+  .toLowerCase();
+  
+  if (/(knee|patell|pfps|acl|mcl|menisc|tka|oa knee|osteoarthritis.*knee)/.test(src)) return "knee";
+  if (/(shoulder|shld|rotator|rtc|imping|bursitis|labrum|adhesive capsul|frozen|biceps tend|supraspinatus)/.test(src)) return "shoulder";
+  if (/(low back|lbp|lumbar|l[-\s]?spine|sciatic|radicul|disc|stenosis|spondyl|facet)/.test(src)) return "lbp";
+  
+  return "general";
+}
 
-router.post("/pt_generate_summary", async (req, res) => {
-  try {
-    const f = normalizeFields(req.body?.fields || {});
-    const summaryType = normalizeSummaryType(req.body?.summary_type);
-    
-    const name =
-    safeStr(f.name) ||
-    safeStr(f.pt_patient_name) ||
-    safeStr(f.patient_name) ||
-    safeStr(f.full_name) ||
-    "Pt";
-    
-    const age = computeAge(f.dob, f.age || "X");
-    const gender = safeStr(f.gender || "patient").toLowerCase();
-    const pmh = safeStr(f.history) || "no significant history";
-    const meds = safeStr(f.meds) || "N/A";
-    const today = safeStr(f.currentdate) || new Date().toLocaleDateString("en-US");
-    
-    let prompt = "";
-    
-    if (summaryType === "Evaluation") {
-      prompt =
-      "Generate a concise 7–8 sentence PT evaluation assessment summary that is Medicare compliant. " +
-      "No bullets. No arrows. Do not use 'the patient' or third-person pronouns.\n\n" +
-      `Start with EXACTLY: "${name}, a ${age} y/o ${gender} with PMH of ${pmh}."\n` +
-      `Include PT eval on ${today}. Primary complaint: ${safeStr(f.subjective) || "N/A"}. ` +
-      `Meds: ${meds}. Referring dx: ${safeStr(f.meddiag) || "N/A"}. ` +
-      `Summarize impairments (ROM: ${safeStr(f.rom) || "N/A"}; strength: ${safeStr(f.strength) || "N/A"}; posture: ${safeStr(f.posture) || "N/A"}). ` +
-      `Summarize functional limitations: ${safeStr(f.functional) || "N/A"}. ` +
-      "End by stating continued skilled PT is medically necessary to progress toward PLOF.";
-    } else if (summaryType === "Progress Note") {
-      prompt =
-      "Generate a concise 5–7 sentence PT progress note summary that is Medicare compliant. " +
-      "No bullets. No arrows. Use 'Pt' only.\n\n" +
-      `Context: ${safeStr(f.subjective) || "N/A"}\n` +
-      `Objective cues: ROM: ${safeStr(f.rom) || "N/A"}; strength: ${safeStr(f.strength) || "N/A"}; functional: ${safeStr(f.functional) || "N/A"}.\n` +
-      "Include progress/tolerance and continued need for skilled PT per POC.";
-    } else {
-      prompt =
-      "Generate a concise 5–7 sentence PT discharge summary that is Medicare compliant. " +
-      "No bullets. No arrows. Use 'Pt' only.\n\n" +
-      `Discharge context: ${safeStr(f.subjective) || "N/A"}\n` +
-      `Functional status: ${safeStr(f.functional) || "N/A"}; remaining impairments: ${safeStr(f.impairments) || "N/A"}.\n` +
-      "Include current status, goal status (met/partially met if supported), HEP and follow-up recommendations without inventing facts.";
-    }
-    
-    const narrativeDraft = await gptCall(prompt, 520);
-    const narrative = await enforceCleanOutputOrRepair({
-      text: narrativeDraft,
-      purpose: "PT summary",
-      maxTokens: 420,
-    });
-    
-    // ✅ Append SOAP block (your Swift can relocate it if needed)
-    const soap = buildSoapAssessment(f);
-    
-    return res.json({ result: `${narrative}\n\n${soap}`.trim() });
-  } catch (e) {
-    return jsonError(res, 500, "pt_generate_summary failed", e?.message || e);
-  }
-});
+function detectOTRegion(f) {
+  const src = [
+    f.meddiag,
+    f.pain_location,
+    f.painLocation,
+    f.region,
+    f.body_region,
+    f.bodyRegion,
+    f.summary,
+    f.subjective,
+    f.impairments,
+    f.functional,
+  ]
+  .filter(Boolean)
+  .join(" ")
+  .toLowerCase();
+  
+  // Neuro / CVA / TBI etc.
+  if (/(cva|stroke|tbi|brain injury|parkinson|ms\b|cp\b|hemip|neglect|ataxia|aphasia)/.test(src)) return "neuro";
+  
+  // Hand/Wrist
+  if (/(hand|wrist|carpal|ctr\b|trigger finger|dupuy|tenosynov|de quervain|metacarp|phalanx|thumb|cmc)/.test(src))
+    return "hand_wrist";
+  
+  // Elbow
+  if (/(elbow|lateral epicond|tennis elbow|medial epicond|golfer|olecranon)/.test(src)) return "elbow";
+  
+  // Shoulder (OT often UE shoulder)
+  if (/(shoulder|shld|rotator|rtc|imping|adhesive capsul|frozen|biceps tend)/.test(src)) return "shoulder";
+  
+  return "general";
+}
 
-router.post("/pt_generate_goals", async (req, res) => {
-  try {
-    const f = normalizeFields(req.body?.fields || {});
-    
-    const prompt = `
+const PT_GOAL_BANKS = {
+  lbp: {
+    label: "PT — Low Back / Lumbar",
+    painActivities: [
+      "prolonged sitting",
+      "prolonged standing",
+      "household ambulation",
+      "functional bending",
+      "lifting light household items",
+      "transfers (sit<>stand/bed mobility)",
+    ],
+    objectiveFocus: [
+      "trunk AROM (flexion/extension/side-bending)",
+      "hip strength and lumbopelvic stability",
+      "core endurance and motor control",
+      "functional tolerance (standing/walking duration)",
+    ],
+    measures: [
+      "increase trunk AROM by ≥[measurable amount]",
+      "improve core endurance by ≥[measurable amount]",
+      "increase standing tolerance by ≥[measurable amount]",
+      "increase walking tolerance by ≥[measurable amount]",
+    ],
+    mobilityLine: ["independent", "modified independent", "SBA", "CGA", "min A"],
+  },
+  
+  knee: {
+    label: "PT — Knee",
+    painActivities: [
+      "sit<>stand transfers",
+      "stair negotiation",
+      "prolonged walking",
+      "squatting to retrieve items",
+      "car transfers",
+      "household ambulation",
+    ],
+    objectiveFocus: [
+      "knee AROM (flexion/extension)",
+      "quad/hamstring strength",
+      "hip strength for dynamic valgus control",
+      "single-limb stability/balance",
+    ],
+    measures: [
+      "increase knee flexion/extension AROM by ≥[measurable amount]",
+      "improve quad strength by ≥[measurable amount]",
+      "improve stair tolerance by ≥[measurable amount]",
+      "improve transfer performance by ≥[measurable amount]",
+    ],
+    mobilityLine: ["independent", "modified independent", "SBA", "CGA", "min A"],
+  },
+  
+  shoulder: {
+    label: "PT — Shoulder",
+    painActivities: [
+      "reaching overhead",
+      "reaching behind back",
+      "lifting/carrying light household items",
+      "donning/doffing shirt/jacket",
+      "grooming/hair care",
+      "sleep positioning without symptom flare",
+    ],
+    objectiveFocus: [
+      "shoulder AROM (flex/abd/ER/IR)",
+      "scapular stability and rotator cuff strength",
+      "postural control and thoracic mobility as applicable",
+      "functional reaching tolerance",
+    ],
+    measures: [
+      "increase shoulder AROM by ≥[measurable amount]",
+      "improve rotator cuff/scapular strength by ≥[measurable amount]",
+      "improve overhead tolerance by ≥[measurable amount]",
+      "reduce symptom provocation with reaching tasks",
+    ],
+    mobilityLine: ["independent", "modified independent", "SBA", "CGA", "min A"],
+  },
+  
+  general: {
+    label: "PT — General",
+    painActivities: [
+      "walking",
+      "standing tasks",
+      "sitting tolerance",
+      "transfers",
+      "lifting light household items",
+      "stairs as applicable",
+    ],
+    objectiveFocus: ["ROM as applicable", "strength as applicable", "activity tolerance", "functional mobility"],
+    measures: [
+      "improve ROM by ≥[measurable amount]",
+      "improve strength by ≥[measurable amount]",
+      "improve activity tolerance by ≥[measurable amount]",
+    ],
+    mobilityLine: ["independent", "modified independent", "SBA", "CGA", "min A"],
+  },
+};
+
+const OT_GOAL_BANKS = {
+  shoulder: {
+    label: "OT — UE Shoulder",
+    adlTasks: [
+      "donning/doffing shirt or jacket",
+      "grooming/hair care",
+      "reaching to cabinets (light items)",
+      "meal prep reaching tasks",
+      "sleep positioning without symptom flare",
+    ],
+    objectiveFocus: [
+      "UE AROM (shoulder flex/abd/ER/IR) as applicable",
+      "scapular control and proximal stability",
+      "functional reach tolerance with pain management strategies",
+      "task modification and joint protection",
+    ],
+    measures: [
+      "increase UE AROM by ≥[measurable amount]",
+      "improve functional reaching tolerance for ≥[time] without symptom flare",
+      "reduce pain to ≤[target]/10 during functional reaching",
+      "improve performance using AE/compensatory strategies as indicated",
+    ],
+    assistance: ["independent", "modified independent", "SBA", "CGA", "min A"],
+  },
+  
+  elbow: {
+    label: "OT — Elbow",
+    adlTasks: [
+      "self-care tasks requiring elbow flex/extend",
+      "lifting/carrying light household items",
+      "household cleaning tasks",
+      "meal prep/light cooking",
+      "computer/phone use with symptom management",
+    ],
+    objectiveFocus: [
+      "elbow/wrist AROM as applicable",
+      "grip/pinch strength as applicable",
+      "pain management and activity modification",
+      "endurance for repetitive UE tasks",
+    ],
+    measures: [
+      "increase elbow AROM by ≥[measurable amount]",
+      "improve grip/pinch by ≥[measurable amount]",
+      "reduce pain to ≤[target]/10 during repetitive UE tasks",
+      "tolerate ≥[time] of functional UE activity with pacing strategies",
+    ],
+    assistance: ["independent", "modified independent", "SBA", "CGA", "min A"],
+  },
+  
+  hand_wrist: {
+    label: "OT — Hand/Wrist",
+    adlTasks: [
+      "buttoning/zippers",
+      "opening containers/jars",
+      "writing/typing",
+      "self-feeding tasks",
+      "light household chores requiring grasp",
+    ],
+    objectiveFocus: [
+      "wrist/hand ROM as applicable",
+      "grip/pinch strength",
+      "edema/pain management strategies as applicable",
+      "fine motor coordination and dexterity",
+      "joint protection and AE training",
+    ],
+    measures: [
+      "increase wrist/hand ROM by ≥[measurable amount]",
+      "improve grip/pinch by ≥[measurable amount]",
+      "improve fine motor control to complete [task] with ≤[assist] cues",
+      "reduce pain to ≤[target]/10 during functional grasp/release",
+    ],
+    assistance: ["independent", "modified independent", "SBA", "CGA", "min A"],
+  },
+  
+  neuro: {
+    label: "OT — Neuro (CVA/TBI/etc.)",
+    adlTasks: [
+      "dressing with strategy use",
+      "bathing with safety setup",
+      "toileting routine with sequencing strategies",
+      "simple meal prep with compensatory techniques",
+      "home management task with safety awareness",
+    ],
+    objectiveFocus: [
+      "UE motor control and functional use",
+      "balance/safety during ADLs as applicable",
+      "cognitive strategies (sequencing/attention) as applicable",
+      "visual-perceptual/neglect strategies as applicable",
+      "caregiver training and home safety recommendations",
+    ],
+    measures: [
+      "complete [ADL] with ≤[level] cues using compensatory strategies",
+      "improve functional UE use during [task] with ≥[measurable amount] carryover",
+      "tolerate ≥[time] of structured ADL activity with rest breaks as needed",
+      "demonstrate safety awareness during ADLs with ≤[number] cues",
+    ],
+    assistance: ["independent", "modified independent", "SBA", "CGA", "min A", "mod A"],
+  },
+  
+  general: {
+    label: "OT — General",
+    adlTasks: ["dressing", "grooming", "bathing", "meal prep", "light home management", "functional reaching/lifting (light)"],
+    objectiveFocus: ["ROM as applicable", "strength/endurance as applicable", "pain management strategies", "AE training and task modification"],
+    measures: [
+      "improve ROM by ≥[measurable amount]",
+      "improve strength/endurance by ≥[measurable amount]",
+      "reduce pain to ≤[target]/10 during ADLs",
+      "complete [task] with [assist level] using AE/strategies as needed",
+    ],
+    assistance: ["independent", "modified independent", "SBA", "CGA", "min A"],
+  },
+};
+
+function buildPTGoalsPrompt(f, regionKey) {
+  const bank = PT_GOAL_BANKS[regionKey] || PT_GOAL_BANKS.general;
+  const diag = safeStr(f.meddiag) || safeStr(f.pain_location || f.painLocation) || "N/A";
+  
+  return `
 You are a clinical assistant helping a Physical Therapist write documentation.
 
 Use ONLY the info below. Do NOT invent details.
-No bullets/numbering in free text beyond the required numbered goal lines.
 Do NOT use third-person pronouns; use "Pt" only.
+No bullets beyond the required numbered goal lines.
+Do NOT add or remove any sections.
 
-Diagnosis/Region: ${safeStr(f.meddiag) || safeStr(f.pain_location || f.painLocation) || "N/A"}
+Diagnosis/Region: ${diag}
 Strength: ${safeStr(f.strength) || "N/A"}
 ROM: ${safeStr(f.rom) || "N/A"}
 Impairments: ${safeStr(f.impairments) || "N/A"}
 Functional Limitations: ${safeStr(f.functional) || "N/A"}
 
+Region Bank Selected: ${bank.label}
+
+You MUST generate goals using ONLY these option pools (choose different options to create variation):
+- Pain activity options: ${bank.painActivities.join(", ")}
+- Objective focus options: ${bank.objectiveFocus.join(", ")}
+- Measure phrasing options: ${bank.measures.join(", ")}
+- Mobility independence options: ${bank.mobilityLine.join(", ")}
+
+Variability rules:
+- Choose a pain activity option for STG #1.
+- For STG #2, choose ONE objective focus option and ONE measure phrasing option.
+- For STG #4, choose ONE mobility independence option.
+- Keep placeholders (e.g., [measurable amount]) if exact values are not provided.
+
 ALWAYS follow this EXACT format. Do NOT add or remove any sections.
 
 Short-Term Goals (1–12 visits):
-1. Pt will report pain ≤[target]/10 during [functional activity].
-2. Pt will improve [objective finding] by ≥[measurable amount] to allow [activity].
+1. Pt will report pain ≤[target]/10 during [pain activity option].
+2. Pt will improve [objective focus option] using [measure phrasing option] to allow [activity from functional limitations].
 3. Pt will demonstrate ≥[percent]% adherence to HEP during ADLs.
-4. Pt will perform transfers or mobility with [level of independence] to support function.
+4. Pt will perform transfers or mobility with [mobility independence option] to support function.
 
 Long-Term Goals (13–25 visits):
 1. Pt will increase strength of 1 grade or higher or functional capacity to safely perform ADLs.
-2. Pt will restore AROM to WNL to enable daily activities.
+2. Pt will restore AROM to WNL as applicable to enable daily activities.
 3. Pt will demonstrate independence with HEP to prevent reinjury.
 4. Pt will self report resume PLOF with minimal or no symptoms.
 `.trim();
-    
-    const draft = await gptCall(prompt, 450);
-    const result = await enforceCleanOutputOrRepair({
-      text: draft,
-      purpose: "PT goals",
-      maxTokens: 420,
-    });
-    
-    return res.json({ result });
-  } catch (e) {
-    return jsonError(res, 500, "pt_generate_goals failed", e?.message || e);
-  }
-});
+}
 
-// --------------------------------------------------
-// OT ROUTES
-// --------------------------------------------------
+function buildOTGoalsPrompt(f, regionKey) {
+  const bank = OT_GOAL_BANKS[regionKey] || OT_GOAL_BANKS.general;
+  const diag = safeStr(f.meddiag) || safeStr(f.pain_location || f.painLocation) || "N/A";
+  
+  return `
+You are a clinical assistant helping an Occupational Therapist write documentation.
 
-router.post("/ot_generate_diffdx", async (req, res) => {
-  try {
-    const f = normalizeFields(req.body?.fields || {});
-    const pain = buildPainLine(f);
-    
-    const prompt =
-    "You are an OT clinical assistant. Based on the evaluation details below, " +
-    "provide a concise OT differential considerations list (3–6 items) in ONE paragraph separated by semicolons. " +
-    "Use non-diagnostic language ('findings are consistent with / suggestive of'). No bullets.\n\n" +
-    `Subjective:\n${safeStr(f.subjective) || safeStr(f.summary) || "N/A"}\n\n` +
-    `Pain:\n${pain || "N/A"}\n\n` +
-    `Objective:\nROM: ${safeStr(f.rom) || "N/A"}\nStrength: ${safeStr(f.strength) || "N/A"}\n` +
-    `Functional (ADLs/IADLs): ${safeStr(f.functional) || "N/A"}\n` +
-    `Impairments: ${safeStr(f.impairments) || "N/A"}\n`;
-    
-    const draft = await gptCall(prompt, 280);
-    const result = await enforceCleanOutputOrRepair({
-      text: draft,
-      purpose: "OT differential dx",
-      maxTokens: 220,
-    });
-    
-    return res.json({ result });
-  } catch (e) {
-    return jsonError(res, 500, "ot_generate_diffdx failed", e?.message || e);
-  }
-});
+Use ONLY the info below. Do NOT invent details.
+Do NOT use third-person pronouns; use "Pt" only.
+No bullets beyond the required numbered goal lines.
+Do NOT add or remove any sections.
 
-router.post("/ot_generate_summary", async (req, res) => {
-  try {
-    const f = normalizeFields(req.body?.fields || {});
-    const summaryType = normalizeSummaryType(req.body?.summary_type);
-    
-    const name =
-    safeStr(f.name) ||
-    safeStr(f.ot_patient_name) ||
-    safeStr(f.patient_name) ||
-    safeStr(f.full_name) ||
-    "Pt";
-    
-    const age = computeAge(f.dob, f.age || "X");
-    const gender = safeStr(f.gender || "patient").toLowerCase();
-    const pmh = safeStr(f.history) || "no significant history";
-    const meds = safeStr(f.meds) || "N/A";
-    const today = safeStr(f.currentdate) || new Date().toLocaleDateString("en-US");
-    
-    let prompt = "";
-    
-    if (summaryType === "Evaluation") {
-      prompt =
-      "Generate a concise 7–8 sentence OT evaluation assessment summary that is Medicare compliant. " +
-      "No bullets. No arrows. Use 'Pt' only.\n\n" +
-      `Start with EXACTLY: "${name}, a ${age} y/o ${gender} with PMH of ${pmh}."\n` +
-      `Include OT eval on ${today}. Primary complaint: ${safeStr(f.subjective) || safeStr(f.summary) || "N/A"}. ` +
-      `Meds: ${meds}. Referring dx: ${safeStr(f.meddiag) || "N/A"}. ` +
-      `Summarize UE function/ROM/strength if provided (ROM: ${safeStr(f.rom) || "N/A"}; strength: ${safeStr(f.strength) || "N/A"}). ` +
-      `Summarize ADL/IADL limitations: ${safeStr(f.functional) || "N/A"}. ` +
-      "End by stating continued skilled OT is medically necessary to improve safety and independence with ADLs/IADLs.";
-    } else if (summaryType === "Progress Note") {
-      prompt =
-      "Generate a concise 5–7 sentence OT progress note summary that is Medicare compliant. " +
-      "No bullets. No arrows. Use 'Pt' only.\n\n" +
-      `Context: ${safeStr(f.subjective) || safeStr(f.summary) || "N/A"}\n` +
-      `Objective cues: ROM: ${safeStr(f.rom) || "N/A"}; strength: ${safeStr(f.strength) || "N/A"}; ADL/IADL function: ${safeStr(f.functional) || "N/A"}.\n` +
-      "Include progress/tolerance and continued need for skilled OT per POC.";
-    } else {
-      prompt =
-      "Generate a concise 5–7 sentence OT discharge summary that is Medicare compliant. " +
-      "No bullets. No arrows. Use 'Pt' only.\n\n" +
-      `Discharge context: ${safeStr(f.subjective) || safeStr(f.summary) || "N/A"}\n` +
-      `Functional status (ADLs/IADLs): ${safeStr(f.functional) || "N/A"}; remaining impairments: ${safeStr(f.impairments) || "N/A"}.\n` +
-      "Include current status, HEP/strategy carryover, and follow-up recommendations without inventing facts.";
-    }
-    
-    const narrativeDraft = await gptCall(prompt, 520);
-    const narrative = await enforceCleanOutputOrRepair({
-      text: narrativeDraft,
-      purpose: "OT summary",
-      maxTokens: 420,
-    });
-    
-    // SOAP block is still useful for your Swift relocation logic (even if OT)
-    const soap = buildSoapAssessment(f);
-    
-    return res.json({ result: `${narrative}\n\n${soap}`.trim() });
-  } catch (e) {
-    return jsonError(res, 500, "ot_generate_summary failed", e?.message || e);
-  }
-});
+Diagnosis/Region: ${diag}
+Summary: ${safeStr(f.summary) || safeStr(f.subjective) || "N/A"}
+Strength: ${safeStr(f.strength) || "N/A"}
+ROM: ${safeStr(f.rom) || "N/A"}
+Impairments: ${safeStr(f.impairments) || "N/A"}
+Functional Limitations (ADLs/IADLs): ${safeStr(f.functional) || "N/A"}
 
-router.post("/ot_generate_goals", async (req, res) => {
-  try {
-    const f = normalizeFields(req.body?.fields || {});
-    
-    const summary = safeStr(f.summary) || safeStr(f.subjective) || "N/A";
-    
-    const prompt = `
-You are a clinical assistant helping an occupational therapist write documentation.
+Region Bank Selected: ${bank.label}
 
-Below is the patient's evaluation data. Use ONLY this information.
-Do NOT invent details. Do NOT use third-person pronouns.
-Always refer to the person as "Pt".
+You MUST generate goals using ONLY these option pools (choose different options to create variation):
+- ADL/IADL task options: ${bank.adlTasks.join(", ")}
+- Objective focus options: ${bank.objectiveFocus.join(", ")}
+- Measure phrasing options: ${bank.measures.join(", ")}
+- Assistance/independence options: ${bank.assistance.join(", ")}
 
-Evaluation Summary:
-${summary}
+Variability rules:
+- Choose an ADL/IADL task option for STG #1 and a different task for LTG #2 when possible.
+- For STG #2, choose ONE objective focus option and ONE measure phrasing option.
+- Use placeholders if exact values are not provided.
 
-Pain:
-${safeStr(f.pain_location || f.painLocation) || "N/A"}
-
-ROM:
-${safeStr(f.rom) || "N/A"}
-
-Strength:
-${safeStr(f.strength) || "N/A"}
-
-Impairments:
-${safeStr(f.impairments) || "N/A"}
-
-Functional Limitations (ADLs/IADLs):
-${safeStr(f.functional) || "N/A"}
-
-Generate Medicare-compliant OT goals using EXACTLY the following structure.
-Do NOT add or remove sections or lines.
+ALWAYS follow this EXACT format. Do NOT add or remove any sections.
 
 Short-Term Goals (1–12 visits):
-1. Pt will perform [specific ADL/IADL] with [level of assistance or AE] to improve functional independence.
-2. Pt will improve [ROM/strength/endurance] by [measurable amount] to support safe task performance.
-3. Pt will demonstrate improved activity tolerance during [task] with appropriate pacing or strategy use.
-4. Pt will report pain ≤[target]/10 during completion of [functional task].
+1. Pt will perform [ADL/IADL task option] with [assistance/independence option or AE] to improve functional independence.
+2. Pt will improve [objective focus option] using [measure phrasing option] to support safe task performance.
+3. Pt will demonstrate improved activity tolerance during [ADL/IADL task option] with appropriate pacing or strategy use.
+4. Pt will report pain ≤[target]/10 during completion of [ADL/IADL task option].
 
 Long-Term Goals (13–25 visits):
 1. Pt will independently perform ADLs/IADLs using learned strategies or AE as needed.
-2. Pt will demonstrate safe completion of [home/community task] without increased symptoms.
+2. Pt will demonstrate safe completion of [ADL/IADL task option] without increased symptoms.
 3. Pt will tolerate ≥[time] of functional activity to support daily routines.
 4. Pt will independently manage HEP and compensatory strategies to maintain functional gains.
 `.trim();
-    
-    const draft = await gptCall(prompt, 450);
-    const result = await enforceCleanOutputOrRepair({
-      text: draft,
-      purpose: "OT goals",
-      maxTokens: 420,
-    });
-    
-    return res.json({ result });
-  } catch (e) {
-    return jsonError(res, 500, "ot_generate_goals failed", e?.message || e);
-  }
-});
-
-// --------------------------------------------------
-// EXPORT ROUTER
-// --------------------------------------------------
-
-export default router;
+}
