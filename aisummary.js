@@ -423,10 +423,10 @@ Short-Term Goals (1–12 visits):
 4. Pt will perform transfers or mobility with [level of independence] to support function.
 
 Long-Term Goals (13–25 visits):
-1. Pt will increase strength or functional capacity to safely perform ADLs.
-2. Pt will restore ROM to within functional limits to enable daily activities.
+1. Pt will increase strength of 1 grade or higher or functional capacity to safely perform ADLs.
+2. Pt will restore AROM to WNL to enable daily activities.
 3. Pt will demonstrate independence with HEP to prevent reinjury.
-4. Pt will resume PLOF with minimal or no symptoms.
+4. Pt will self report resume PLOF with minimal or no symptoms.
 `.trim();
     
     const draft = await gptCall(prompt, 450);
