@@ -1,4 +1,5 @@
-// Express routes for PT/OT diffdx, summary, goals
+// ======================= aisummary.js (PART 1/2) =======================
+// FULL DROP-IN (PT/OT diffdx, summary, goals) + Region-specific goal banks (PT + OT)
 //
 // Endpoints (POST):
 //  - /pt_generate_diffdx
@@ -140,6 +141,9 @@ function normalizeFields(fields = {}) {
     ["functional", "functional"],
     ["rom", "rom"],
     ["strength", "strength"],
+    ["posture", "posture"],
+    ["palpation", "palpation"],
+    ["goals", "goals"],
   ];
   
   for (const [snake, camel] of aliasPairs) {
@@ -350,17 +354,9 @@ function detectOTRegion(f) {
   .join(" ")
   .toLowerCase();
   
-  // Neuro / CVA / TBI etc.
   if (/(cva|stroke|tbi|brain injury|parkinson|ms\b|cp\b|hemip|neglect|ataxia|aphasia)/.test(src)) return "neuro";
-  
-  // Hand/Wrist
-  if (/(hand|wrist|carpal|ctr\b|trigger finger|dupuy|tenosynov|de quervain|metacarp|phalanx|thumb|cmc)/.test(src))
-    return "hand_wrist";
-  
-  // Elbow
+  if (/(hand|wrist|carpal|ctr\b|trigger finger|dupuy|tenosynov|de quervain|metacarp|phalanx|thumb|cmc)/.test(src)) return "hand_wrist";
   if (/(elbow|lateral epicond|tennis elbow|medial epicond|golfer|olecranon)/.test(src)) return "elbow";
-  
-  // Shoulder (OT often UE shoulder)
   if (/(shoulder|shld|rotator|rtc|imping|adhesive capsul|frozen|biceps tend)/.test(src)) return "shoulder";
   
   return "general";
@@ -670,3 +666,243 @@ Long-Term Goals (13–25 visits):
 4. Pt will independently manage HEP and compensatory strategies to maintain functional gains.
 `.trim();
 }
+// ======================= aisummary.js (PART 2/2) =======================
+
+// --------------------------------------------------
+// PT ROUTES
+// --------------------------------------------------
+
+router.post("/pt_generate_diffdx", async (req, res) => {
+  try {
+    const f = normalizeFields(req.body?.fields || {});
+    const pain = buildPainLine(f);
+    
+    const prompt =
+    "You are a PT clinical assistant. Based on the evaluation details below, " +
+    "provide a concise PT differential diagnosis (3–6 items) in ONE paragraph separated by semicolons. " +
+    "Do NOT state as confirmed diagnosis; use language such as 'findings are consistent with / suggestive of'. " +
+    "No bullets.\n\n" +
+    `Subjective:\n${safeStr(f.subjective) || "N/A"}\n\n` +
+    `Pain:\n${pain || "N/A"}\n\n` +
+    `Objective:\nROM: ${safeStr(f.rom) || "N/A"}\nStrength: ${safeStr(f.strength) || "N/A"}\nPosture: ${safeStr(f.posture) || "N/A"}\n` +
+    `Functional: ${safeStr(f.functional) || "N/A"}\n`;
+    
+    const draft = await gptCall(prompt, 280, 0.2);
+    const result = await enforceCleanOutputOrRepair({
+      text: draft,
+      purpose: "PT differential dx",
+      maxTokens: 220,
+      allowNumbered: false,
+    });
+    
+    return res.json({ result });
+  } catch (e) {
+    return jsonError(res, 500, "pt_generate_diffdx failed", e?.message || e);
+  }
+});
+
+router.post("/pt_generate_summary", async (req, res) => {
+  try {
+    const f = normalizeFields(req.body?.fields || {});
+    const summaryType = normalizeSummaryType(req.body?.summary_type);
+    
+    const name =
+    safeStr(f.name) ||
+    safeStr(f.pt_patient_name) ||
+    safeStr(f.patient_name) ||
+    safeStr(f.full_name) ||
+    "Pt";
+    
+    const age = computeAge(f.dob, f.age || "X");
+    const gender = safeStr(f.gender || "patient").toLowerCase();
+    const pmh = safeStr(f.history) || "no significant history";
+    const meds = safeStr(f.meds) || "N/A";
+    const today = safeStr(f.currentdate) || new Date().toLocaleDateString("en-US");
+    
+    let prompt = "";
+    
+    if (summaryType === "Evaluation") {
+      prompt =
+      "Generate a concise 7–8 sentence PT evaluation assessment summary that is Medicare compliant. " +
+      "No bullets. No arrows. Do not use 'the patient' or third-person pronouns.\n\n" +
+      `Start with EXACTLY: "${name}, a ${age} y/o ${gender} with PMH of ${pmh}."\n` +
+      `Include PT eval on ${today}. Primary complaint: ${safeStr(f.subjective) || "N/A"}. ` +
+      `Meds: ${meds}. Referring dx: ${safeStr(f.meddiag) || "N/A"}. ` +
+      `Summarize impairments (ROM: ${safeStr(f.rom) || "N/A"}; strength: ${safeStr(f.strength) || "N/A"}; posture: ${safeStr(f.posture) || "N/A"}). ` +
+      `Summarize functional limitations: ${safeStr(f.functional) || "N/A"}. ` +
+      "End by stating continued skilled PT is medically necessary to progress toward PLOF.";
+    } else if (summaryType === "Progress Note") {
+      prompt =
+      "Generate a concise 5–7 sentence PT progress note summary that is Medicare compliant. " +
+      "No bullets. No arrows. Use 'Pt' only.\n\n" +
+      `Context: ${safeStr(f.subjective) || "N/A"}\n` +
+      `Objective cues: ROM: ${safeStr(f.rom) || "N/A"}; strength: ${safeStr(f.strength) || "N/A"}; functional: ${safeStr(f.functional) || "N/A"}.\n` +
+      "Include progress/tolerance and continued need for skilled PT per POC.";
+    } else {
+      prompt =
+      "Generate a concise 5–7 sentence PT discharge summary that is Medicare compliant. " +
+      "No bullets. No arrows. Use 'Pt' only.\n\n" +
+      `Discharge context: ${safeStr(f.subjective) || "N/A"}\n` +
+      `Functional status: ${safeStr(f.functional) || "N/A"}; remaining impairments: ${safeStr(f.impairments) || "N/A"}.\n` +
+      "Include current status, goal status (met/partially met if supported), HEP and follow-up recommendations without inventing facts.";
+    }
+    
+    const narrativeDraft = await gptCall(prompt, 520, 0.2);
+    const narrative = await enforceCleanOutputOrRepair({
+      text: narrativeDraft,
+      purpose: "PT summary",
+      maxTokens: 420,
+      allowNumbered: false,
+    });
+    
+    const soap = buildSoapAssessment(f);
+    
+    return res.json({ result: `${narrative}\n\n${soap}`.trim() });
+  } catch (e) {
+    return jsonError(res, 500, "pt_generate_summary failed", e?.message || e);
+  }
+});
+
+router.post("/pt_generate_goals", async (req, res) => {
+  try {
+    const f = normalizeFields(req.body?.fields || {});
+    const region = detectPTRegion(f);
+    
+    const prompt = buildPTGoalsPrompt(f, region);
+    
+    // Slightly higher temp encourages variation within the bank while staying bounded
+    const draft = await gptCall(prompt, 520, 0.35);
+    const result = await enforceCleanOutputOrRepair({
+      text: draft,
+      purpose: "PT goals",
+      maxTokens: 420,
+      allowNumbered: true,
+    });
+    
+    return res.json({ result, region });
+  } catch (e) {
+    return jsonError(res, 500, "pt_generate_goals failed", e?.message || e);
+  }
+});
+
+// --------------------------------------------------
+// OT ROUTES
+// --------------------------------------------------
+
+router.post("/ot_generate_diffdx", async (req, res) => {
+  try {
+    const f = normalizeFields(req.body?.fields || {});
+    const pain = buildPainLine(f);
+    
+    const prompt =
+    "You are an OT clinical assistant. Based on the evaluation details below, " +
+    "provide a concise OT differential considerations list (3–6 items) in ONE paragraph separated by semicolons. " +
+    "Use non-diagnostic language ('findings are consistent with / suggestive of'). No bullets.\n\n" +
+    `Subjective:\n${safeStr(f.subjective) || safeStr(f.summary) || "N/A"}\n\n` +
+    `Pain:\n${pain || "N/A"}\n\n` +
+    `Objective:\nROM: ${safeStr(f.rom) || "N/A"}\nStrength: ${safeStr(f.strength) || "N/A"}\n` +
+    `Functional (ADLs/IADLs): ${safeStr(f.functional) || "N/A"}\n` +
+    `Impairments: ${safeStr(f.impairments) || "N/A"}\n`;
+    
+    const draft = await gptCall(prompt, 280, 0.2);
+    const result = await enforceCleanOutputOrRepair({
+      text: draft,
+      purpose: "OT differential dx",
+      maxTokens: 220,
+      allowNumbered: false,
+    });
+    
+    return res.json({ result });
+  } catch (e) {
+    return jsonError(res, 500, "ot_generate_diffdx failed", e?.message || e);
+  }
+});
+
+router.post("/ot_generate_summary", async (req, res) => {
+  try {
+    const f = normalizeFields(req.body?.fields || {});
+    const summaryType = normalizeSummaryType(req.body?.summary_type);
+    
+    const name =
+    safeStr(f.name) ||
+    safeStr(f.ot_patient_name) ||
+    safeStr(f.patient_name) ||
+    safeStr(f.full_name) ||
+    "Pt";
+    
+    const age = computeAge(f.dob, f.age || "X");
+    const gender = safeStr(f.gender || "patient").toLowerCase();
+    const pmh = safeStr(f.history) || "no significant history";
+    const meds = safeStr(f.meds) || "N/A";
+    const today = safeStr(f.currentdate) || new Date().toLocaleDateString("en-US");
+    
+    let prompt = "";
+    
+    if (summaryType === "Evaluation") {
+      prompt =
+      "Generate a concise 7–8 sentence OT evaluation assessment summary that is Medicare compliant. " +
+      "No bullets. No arrows. Use 'Pt' only.\n\n" +
+      `Start with EXACTLY: "${name}, a ${age} y/o ${gender} with PMH of ${pmh}."\n` +
+      `Include OT eval on ${today}. Primary complaint: ${safeStr(f.subjective) || safeStr(f.summary) || "N/A"}. ` +
+      `Meds: ${meds}. Referring dx: ${safeStr(f.meddiag) || "N/A"}. ` +
+      `Summarize UE function/ROM/strength if provided (ROM: ${safeStr(f.rom) || "N/A"}; strength: ${safeStr(f.strength) || "N/A"}). ` +
+      `Summarize ADL/IADL limitations: ${safeStr(f.functional) || "N/A"}. ` +
+      "End by stating continued skilled OT is medically necessary to improve safety and independence with ADLs/IADLs.";
+    } else if (summaryType === "Progress Note") {
+      prompt =
+      "Generate a concise 5–7 sentence OT progress note summary that is Medicare compliant. " +
+      "No bullets. No arrows. Use 'Pt' only.\n\n" +
+      `Context: ${safeStr(f.subjective) || safeStr(f.summary) || "N/A"}\n` +
+      `Objective cues: ROM: ${safeStr(f.rom) || "N/A"}; strength: ${safeStr(f.strength) || "N/A"}; ADL/IADL function: ${safeStr(f.functional) || "N/A"}.\n` +
+      "Include progress/tolerance and continued need for skilled OT per POC.";
+    } else {
+      prompt =
+      "Generate a concise 5–7 sentence OT discharge summary that is Medicare compliant. " +
+      "No bullets. No arrows. Use 'Pt' only.\n\n" +
+      `Discharge context: ${safeStr(f.subjective) || safeStr(f.summary) || "N/A"}\n` +
+      `Functional status (ADLs/IADLs): ${safeStr(f.functional) || "N/A"}; remaining impairments: ${safeStr(f.impairments) || "N/A"}.\n` +
+      "Include current status, HEP/strategy carryover, and follow-up recommendations without inventing facts.";
+    }
+    
+    const narrativeDraft = await gptCall(prompt, 520, 0.2);
+    const narrative = await enforceCleanOutputOrRepair({
+      text: narrativeDraft,
+      purpose: "OT summary",
+      maxTokens: 420,
+      allowNumbered: false,
+    });
+    
+    const soap = buildSoapAssessment(f);
+    
+    return res.json({ result: `${narrative}\n\n${soap}`.trim() });
+  } catch (e) {
+    return jsonError(res, 500, "ot_generate_summary failed", e?.message || e);
+  }
+});
+
+router.post("/ot_generate_goals", async (req, res) => {
+  try {
+    const f = normalizeFields(req.body?.fields || {});
+    const region = detectOTRegion(f);
+    
+    const prompt = buildOTGoalsPrompt(f, region);
+    
+    const draft = await gptCall(prompt, 520, 0.35);
+    const result = await enforceCleanOutputOrRepair({
+      text: draft,
+      purpose: "OT goals",
+      maxTokens: 420,
+      allowNumbered: true,
+    });
+    
+    return res.json({ result, region });
+  } catch (e) {
+    return jsonError(res, 500, "ot_generate_goals failed", e?.message || e);
+  }
+});
+
+// --------------------------------------------------
+// EXPORT ROUTER
+// --------------------------------------------------
+
+export default router;
