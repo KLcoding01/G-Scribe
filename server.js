@@ -1,4 +1,4 @@
-// ======================= server.js (PART 1/4) =======================
+// ======================= server.js (FULL, UPDATED) =======================
 // server.js (DROP-IN, FULLY UPDATED)
 // PT/OT Summary backend + PT/OT Eval Builder endpoints for iOS client (SwiftUI)
 
@@ -285,7 +285,7 @@ const TEMPLATE_KEYMAP = {
   pain_relieved: "painRelieved",
   pain_interferes: "painInterferes",
   
-  // ✅ NEW: allow diffdx in snake_case templates too
+  // ✅ allow diffdx in snake_case templates too
   diff_dx: "diffdx",
   differential_dx: "diffdx",
 };
@@ -300,16 +300,95 @@ function mapTemplateToSwiftPayload(templateObj) {
   return out;
 }
 
+// ---------------- Deterministic merge utilities (STABILITY FIX) ----------------
+
+function toCleanString(v) {
+  return String(v ?? "").trim();
+}
+
+function isBlank(v) {
+  return v == null || String(v).trim() === "";
+}
+
+function looksLikePlaceholder(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return true;
+  return (
+          s === "n/a" ||
+          s === "na" ||
+          s === "none" ||
+          s === "tbd" ||
+          s === "unknown" ||
+          s === "-" ||
+          s === "—"
+          );
+}
+
 function stripPatchToAllowedKeys(patch, allowedKeys) {
   const out = {};
   if (!patch || typeof patch !== "object") return out;
   for (const k of allowedKeys) {
-    const v = patch[k];
-    if (typeof v === "string" && v.trim()) out[k] = v.trim();
+    if (!(k in patch)) continue;
+    const v = toCleanString(patch[k]);
+    if (!v) continue; // never write empty strings
+    out[k] = v;
   }
   return out;
 }
-// ======================= server.js (PART 2/4) =======================
+
+/**
+ * Deterministic merge (the key to stability):
+ * - overwrite: always overwrite with incoming
+ * - fill_empty: only fill if base is empty/placeholder
+ * - smart: fill empty/placeholder, and optionally overwrite if incoming looks richer
+ */
+function applyMerge({ base = {}, patch = {}, mergeMode = "fill_empty", allowedKeys = [] }) {
+  const out = { ...(base || {}) };
+  
+  for (const k of allowedKeys) {
+    if (!(k in patch)) continue;
+    
+    const incoming = toCleanString(patch[k]);
+    if (!incoming) continue;
+    
+    const existing = toCleanString(out[k]);
+    
+    if (mergeMode === "overwrite") {
+      out[k] = incoming;
+      continue;
+    }
+    
+    if (mergeMode === "fill_empty") {
+      if (isBlank(existing) || looksLikePlaceholder(existing)) out[k] = incoming;
+      continue;
+    }
+    
+    // smart (conservative)
+    if (isBlank(existing) || looksLikePlaceholder(existing)) {
+      out[k] = incoming;
+      continue;
+    }
+    
+    // Optional “quality upgrade” overwrite (kept conservative)
+    const incomingLooksRicher =
+    incoming.length >= existing.length + 12 ||
+    /\b\d+(\.\d+)?\b/.test(incoming) ||
+    /\b(ROM|MMT|TTP|CGA|SBA|min A|mod A|max A|WNL|hypomobile|Trendelenburg|AOx|HEP)\b/i.test(
+                                                                                             incoming
+                                                                                             );
+    
+    if (incomingLooksRicher) out[k] = incoming;
+  }
+  
+  return out;
+}
+
+function normalizeTranscriptForExtraction(transcript) {
+  const s = normalizeSpaces(transcript);
+  if (!s) return "";
+  const hasSpeaker = /\b(Pt|Patient|Therapist|PT|OT)\s*:/i.test(s);
+  return hasSpeaker ? s : `Transcript:\n${s}`;
+}
 
 // ---------------- Rules ----------------
 
@@ -488,7 +567,10 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
     return { ok: false, reason: "Summary starts with a banned generic opener." };
   
   if (!summary.startsWith(introPrefix))
-    return { ok: false, reason: "First Summary sentence must start with required intro prefix." };
+    return {
+      ok: false,
+      reason: "First Summary sentence must start with required intro prefix.",
+    };
   
   const last = getLastSentence(summary);
   if (last !== closerSentence)
@@ -498,19 +580,19 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
     return { ok: false, reason: "Summary must end with required closing phrase." };
   
   // POC must be one line and match expected
-  if (!isSingleLine(poc))
-    return { ok: false, reason: "POC must be one line." };
+  if (!isSingleLine(poc)) return { ok: false, reason: "POC must be one line." };
   
   const expectedPoc =
   discipline === "OT"
   ? `OT POC: ${pocOpener} TherAct, ADL training, functional training, UE function/coordination, safety/energy conservation, injury prevention to meet goals.`
   : `PT POC: ${pocOpener} TherEx, TherAct, MT, functional training, fall/safety, injury prevention to meet goals.`;
   
-  if (poc !== expectedPoc)
+  if (poc !== expectedPoc) {
     return {
       ok: false,
       reason: `POC must match exact template.\nExpected: ${expectedPoc}\nGot: ${poc}`,
     };
+  }
   
   return { ok: true };
 }
@@ -667,7 +749,6 @@ app.post("/generate", async (req, res) => {
     });
   }
 });
-// ======================= server.js (PART 3/4) =======================
 
 // ---------- Eval Template Catalog (for iOS EvaluationView) ----------
 //
@@ -695,20 +776,28 @@ app.get("/eval/template", (req, res) => {
   return res.json({ template: mapTemplateToSwiftPayload(t) });
 });
 
+/**
+ * /eval/extract (STABLE)
+ * - Extract patch from transcript
+ * - Apply deterministic merge server-side
+ * - Return ONLY changed keys (stable patch semantics for iOS)
+ * - Never hard fail on empty patch (returns debug/meta)
+ */
 app.post("/eval/extract", async (req, res) => {
   try {
     const discipline = normalizeDiscipline(req.body?.discipline);
     const templateName = String(req.body?.templateName || "").trim();
-    const transcript = normalizeSpaces(String(req.body?.transcript || ""));
-    const currentForm = req.body?.currentForm || {};
+    const transcriptRaw = String(req.body?.transcript || "");
+    const transcript = normalizeTranscriptForExtraction(transcriptRaw);
+    const currentForm =
+    req.body?.currentForm && typeof req.body.currentForm === "object" ? req.body.currentForm : {};
     const mergeMode = String(req.body?.mergeMode || "fill_empty");
     
     if (!transcript.trim()) {
       return res.status(400).json({ error: "transcript is required." });
     }
     
-    // ✅ FIXED: Allowed patch keys = Swift EvalFormPatch keys (camelCase)
-    // (You were missing meds + soapGoals + diffdx + soap fields)
+    // ✅ Allowed patch keys = Swift EvalFormPatch keys (camelCase)
     const allowedKeys = [
       "gender",
       "dob",
@@ -720,7 +809,7 @@ app.post("/eval/extract", async (req, res) => {
       "meddiag",
       "history",
       "subjective",
-      "meds", // ✅ FIXED
+      "meds",
       
       "painLocation",
       "painOnset",
@@ -744,7 +833,7 @@ app.post("/eval/extract", async (req, res) => {
       "special",
       "impairments",
       
-      "diffdx", // ✅ NEW
+      "diffdx",
       
       "assessmentSummary",
       "goals",
@@ -757,7 +846,7 @@ app.post("/eval/extract", async (req, res) => {
       "soapRom",
       "soapPalpation",
       "soapFunctional",
-      "soapGoals", // ✅ FIXED
+      "soapGoals",
     ];
     
     // Provide template context if selected
@@ -775,6 +864,7 @@ app.post("/eval/extract", async (req, res) => {
     "Do NOT invent facts. Do NOT output any prose. " +
     'Use PT-style abbreviations and always use "Pt".';
     
+    // IMPORTANT: evidence makes debugging stable (“why did it fill this field?”)
     const user = {
       discipline,
       mergeMode,
@@ -808,9 +898,15 @@ app.post("/eval/extract", async (req, res) => {
         "If text starts with 'medical history', strip the phrase and keep only diagnoses.",
         "Do not include narrative phrases like 'past medical history consists of'.",
         "If unsure, omit.",
+        
+        // --- OUTPUT STRICTNESS ---
+        "Do not output empty strings.",
+        "Only include fields clearly supported by the transcript.",
+        "For each populated field, include a short supporting quote in evidence[field].",
       ],
       outputSchema: {
         patch: "object of allowedKeys -> string values",
+        evidence: "object of allowedKeys -> short quote from transcript supporting patch value",
         debug: "optional array of strings",
       },
     };
@@ -832,8 +928,53 @@ app.post("/eval/extract", async (req, res) => {
       return res.status(422).json({ error: "Model did not return valid JSON.", raw });
     }
     
-    const patch = stripPatchToAllowedKeys(obj.patch, allowedKeys);
-    return res.json({ patch, debug: obj.debug || [] });
+    const rawPatch = stripPatchToAllowedKeys(obj.patch, allowedKeys);
+    const evidence =
+    obj.evidence && typeof obj.evidence === "object" && !Array.isArray(obj.evidence)
+    ? obj.evidence
+    : {};
+    const debug = Array.isArray(obj.debug) ? obj.debug : [];
+    
+    // Deterministic merge (server decides stability)
+    const merged = applyMerge({
+      base: currentForm,
+      patch: rawPatch,
+      mergeMode,
+      allowedKeys,
+    });
+    
+    // Return ONLY changed keys for iOS (stable patch semantics)
+    const patchOut = {};
+    for (const k of allowedKeys) {
+      const before = toCleanString(currentForm?.[k]);
+      const after = toCleanString(merged?.[k]);
+      if (after && after !== before) patchOut[k] = after;
+    }
+    
+    // Never hard-fail on empty patch; return structured debug/meta
+    if (Object.keys(patchOut).length === 0) {
+      return res.json({
+        patch: {},
+        evidence: {},
+        debug: debug.concat(["EMPTY_PATCH: no allowed fields populated from transcript"]),
+        meta: {
+          mergeMode,
+          extractedKeys: Object.keys(rawPatch || {}),
+          changedKeys: [],
+        },
+      });
+    }
+    
+    return res.json({
+      patch: patchOut,
+      evidence,
+      debug,
+      meta: {
+        mergeMode,
+        extractedKeys: Object.keys(rawPatch || {}),
+        changedKeys: Object.keys(patchOut),
+      },
+    });
   } catch (err) {
     console.error("❌ /eval/extract failed");
     console.error(err);
@@ -843,7 +984,6 @@ app.post("/eval/extract", async (req, res) => {
     });
   }
 });
-// ======================= server.js (PART 4/4) =======================
 
 // -------------------------------------------------------------------
 // Legacy AI endpoints expected by iOS EvaluationView candidatePaths.
@@ -942,7 +1082,9 @@ async function handlePTDiffDx(req, res) {
     return res.json({ result });
   } catch (err) {
     console.error("❌ pt_generate_diffdx failed", err?.message || err);
-    return res.status(500).json({ error: "pt_generate_diffdx failed", details: err?.message || String(err) });
+    return res
+    .status(500)
+    .json({ error: "pt_generate_diffdx failed", details: err?.message || String(err) });
   }
 }
 
@@ -963,7 +1105,9 @@ async function handlePTSummary(req, res) {
     return res.json({ result });
   } catch (err) {
     console.error("❌ pt_generate_summary failed", err?.message || err);
-    return res.status(500).json({ error: "pt_generate_summary failed", details: err?.message || String(err) });
+    return res
+    .status(500)
+    .json({ error: "pt_generate_summary failed", details: err?.message || String(err) });
   }
 }
 
@@ -984,9 +1128,25 @@ async function handlePTGoals(req, res) {
     return res.json({ result });
   } catch (err) {
     console.error("❌ pt_generate_goals failed", err?.message || err);
-    return res.status(500).json({ error: "pt_generate_goals failed", details: err?.message || String(err) });
+    return res
+    .status(500)
+    .json({ error: "pt_generate_goals failed", details: err?.message || String(err) });
   }
 }
+
+// -------------------------------------------------------------------
+// Legacy routes (keep your existing paths)
+// -------------------------------------------------------------------
+
+// If your iOS app calls these direct:
+app.post("/pt_generate_diffdx", handlePTDiffDx);
+app.post("/pt_generate_summary", handlePTSummary);
+app.post("/pt_generate_goals", handlePTGoals);
+
+// Also provide aliases under /api/ai/* (in case you route everything there)
+app.post("/api/ai/pt_generate_diffdx", handlePTDiffDx);
+app.post("/api/ai/pt_generate_summary", handlePTSummary);
+app.post("/api/ai/pt_generate_goals", handlePTGoals);
 
 // -------------------------------------------------------------------
 // Listen
