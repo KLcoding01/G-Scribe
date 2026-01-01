@@ -18,7 +18,6 @@ import dotenv from "dotenv";
 import { PT_TEMPLATES, OT_TEMPLATES } from "./templates.js";
 import aiRouter from "./aisummary.js";
 
-import createDictationRouter from "./routes/dictation.js";
 dotenv.config();
 
 const app = express();
@@ -551,9 +550,6 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
 // ✅ Mount aisummary.js ONLY under /api/ai to avoid route collisions.
 app.use("/api/ai", aiRouter);
 
-
-// Dictation normalization (Dragon-like)
-app.use("/api/dictation", createDictationRouter({ openai, model: MODEL }));
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
