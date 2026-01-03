@@ -1,12 +1,14 @@
-// ======================= server.js (FULL, UPDATED + MUSCLE ENFORCEMENT) =======================
+// ======================= server.js (FULL, UPDATED) =======================
 // DROP-IN server.js
 //
-// What’s new in THIS version (your requested fix):
-// 1) Assessment Summary rules are now HARD “must include” for specific muscles by topic.
-// 2) Server-side validator checks the generated PT assessment summary includes required muscle names.
-// 3) If missing, the server runs an automatic REPAIR pass to force muscle specificity (no new facts).
+// CHANGE IN THIS VERSION (per your request):
+// - Muscle-specific rules apply ONLY to PT VISIT SUMMARY (POST /generate).
+// - Evaluation endpoints (pt_generate_summary, eval/*) are unchanged (no muscle enforcement).
 //
-// NOTE: This targets PT eval Assessment Summary endpoint: /pt_generate_summary (and /api/ai/pt_generate_summary)
+// How it works for PT Visit Summary:
+// 1) Detect topics from userText (shoulder/neck/LBP/knee/posture/gait/core/patella hypomobile).
+// 2) Validate the generated "Summary" includes specific muscles (or required phrases like GPM III-IV).
+// 3) If missing, run an additional REPAIR pass that preserves your strict formatting constraints.
 
 import express from "express";
 import cors from "cors";
@@ -316,12 +318,6 @@ function stripPatchToAllowedKeys(patch, allowedKeys) {
   return out;
 }
 
-/**
- * Deterministic merge:
- * - overwrite: always overwrite with incoming
- * - fill_empty: only fill if base empty/placeholder
- * - smart: fill empty/placeholder; optionally overwrite if incoming looks richer
- */
 function applyMerge({ base = {}, patch = {}, mergeMode = "fill_empty", allowedKeys = [] }) {
   const out = { ...(base || {}) };
   
@@ -343,7 +339,6 @@ function applyMerge({ base = {}, patch = {}, mergeMode = "fill_empty", allowedKe
       continue;
     }
     
-    // smart (conservative)
     if (isBlank(existing) || looksLikePlaceholder(existing)) {
       out[k] = incoming;
       continue;
@@ -445,7 +440,17 @@ ${patientLabel}
 `.trim();
 }
 
-function buildRepairPrompt({ patientLabel, userText, badOutput, introPrefix, closerSentence, pocOpener, discipline }) {
+// Repair prompt with OPTIONAL extra constraints (used for muscle enforcement repair)
+function buildRepairPrompt({
+  patientLabel,
+  userText,
+  badOutput,
+  introPrefix,
+  closerSentence,
+  pocOpener,
+  discipline,
+  extraSummaryConstraints = "",
+}) {
   return `
 You must FIX the note to comply with ALL constraints. Do not add facts.
 
@@ -463,6 +468,8 @@ Constraints to enforce:
   ${introPrefix}
 - Summary last sentence MUST be exactly:
   ${closerSentence}
+${extraSummaryConstraints ? `- EXTRA Summary constraints:\n  ${extraSummaryConstraints}\n` : ""}
+
 - POC: ONE line, must be exactly:
   ${
     discipline === "OT"
@@ -548,6 +555,251 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
   return { ok: true };
 }
 
+// ---------------- PT VISIT SUMMARY: topic detection + muscle enforcement ----------------
+
+function includesAny(haystack, needles) {
+  const h = String(haystack || "").toLowerCase();
+  return needles.some((n) => h.includes(String(n).toLowerCase()));
+}
+
+function mustIncludeAny(text, terms) {
+  const s = String(text || "").toLowerCase();
+  return terms.some((t) => s.includes(String(t).toLowerCase()));
+}
+
+function detectVisitTopicsFromUserText(userText) {
+  const all = normalizeSpaces(userText);
+  
+  const neckTopic = includesAny(all, ["neck pain", "cervical", "c-spine", "c spine", "suboccip", "upper trap", "levator"]);
+  const lbpTopic = includesAny(all, ["lbp", "low back", "lowback", "lumbar", "l-spine", "l spine", "radicul", "sciatica", "paraspinal", "ql"]);
+  const shoulderTopic = includesAny(all, ["shoulder pain", "rotator cuff", "rtc", "impingement", "gh", "glenohumeral"]);
+  const kneeTopic = includesAny(all, ["knee pain", "knee oa", "tka", "patella", "patellar"]);
+  
+  const mentionsMT = includesAny(all, [
+    " mt ",
+    "mt,",
+    "mt.",
+    "manual therapy",
+    "manual tx",
+    "stm",
+    "soft tissue",
+    "iastm",
+  ]);
+  
+  const mentionsTherAct = includesAny(all, [
+    "theract",
+    "ther-act",
+    "ther act",
+    "functional training",
+    "functional task",
+    "sit-to-stand",
+    "sit to stand",
+    "sts",
+    "transfer",
+    "transfers",
+    "lifting",
+    "carry",
+  ]);
+  
+  const mentionsCore = includesAny(all, ["core", "abdominal", "abd", "trunk stability", "stabilizer", "stabilizers"]);
+  
+  const patellaHypomobile = includesAny(all, [
+    "patella hypomobile",
+    "patellar hypomobile",
+    "hypomobile patella",
+    "patellar mobility limited",
+  ]);
+  
+  const poorPosture = includesAny(all, [
+    "poor posture",
+    "forward head",
+    "forward head lean",
+    "rounded shoulders",
+    "kyphosis",
+    "scapular protraction",
+  ]);
+  
+  const gaitImpairment = includesAny(all, [
+    "abnormal gait",
+    "impaired gait",
+    "trendelenburg",
+    "antalgic",
+    "shuffling",
+    "decreased stride",
+    "decreased step",
+    "gait deviation",
+  ]);
+  
+  return {
+    neckTopic,
+    lbpTopic,
+    shoulderTopic,
+    kneeTopic,
+    mentionsMT,
+    mentionsTherAct,
+    mentionsCore,
+    patellaHypomobile,
+    poorPosture,
+    gaitImpairment,
+  };
+}
+
+// Build “extra summary constraints” string for the repair prompt (PT visit only)
+function buildPTVisitSummaryMuscleConstraints(userText) {
+  const t = detectVisitTopicsFromUserText(userText);
+  
+  const constraints = [];
+  
+  // Rule 1: If user did not provide any subjective, synthesize one from summary (visit-note generator already forces subjective)
+  // We will NOT add visit-level subjectivity rules here because Subjective is generated separately and must be patient-reported.
+  
+  // Rule 2: Neck
+  if (t.neckTopic) {
+    constraints.push(
+                     "If neck/cervical topic: include STM to release suboccipitals, posterior cervical musculature, UT, and levator scap; include manual stretching emphasizing SCM release/stretch, pec minor stretch, lat stretch, and UT/levator scap stretch; MUST name those muscles (no 'neck muscles')."
+                     );
+  }
+  
+  // Rule 3 + 5: LBP and TherAct
+  if (t.lbpTopic) {
+    constraints.push(
+                     "If LBP/lumbar topic: include STM to release lumbar paraspinals, QL, multifidi, glute med, TFL, and piriformis; include manual stretching to HS, glute med, TFL, and piriformis; MUST name those muscles (no 'back muscles')."
+                     );
+    if (t.mentionsTherAct) {
+      constraints.push(
+                       "If LBP and TherAct mentioned: include TherAct functional training (e.g., sit-to-stand mechanics, transfer training, hip hinge/lifting mechanics, functional mobility tasks) consistent with user instruction, without adding devices or assist levels."
+                       );
+    }
+  }
+  
+  // Rule 4: Core/abd
+  if (t.mentionsCore) {
+    constraints.push(
+                     "If core/abdominal mentioned: include core and abd stabilizers addressed via core activation techniques and TherEx targeting trunk stabilization."
+                     );
+  }
+  
+  // Rule 6: Shoulder + MT mentioned OR shoulder topic alone (still name tissues)
+  if (t.shoulderTopic) {
+    constraints.push(
+                     "If shoulder topic: MUST name supraspinatus, deltoid, infraspinatus, teres minor, teres major, and lats; if MT/STM is referenced, phrase as STM/MT to release those specific tissues (no 'shoulder region')."
+                     );
+  }
+  
+  // Rule 7 + 8: Knee
+  if (t.kneeTopic) {
+    constraints.push(
+                     "If knee topic and MT/STM referenced: MUST name IT band, distal quads, popliteus, distal medial/lateral HS, and proximal medial gastroc (no 'knee muscles')."
+                     );
+    if (t.patellaHypomobile) {
+      constraints.push(
+                       "If patella hypomobile mentioned: include patellar joint mobilization using GPM III-IV in all directions to improve mobility and decrease pain."
+                       );
+    }
+  }
+  
+  // Rule 9: Posture
+  if (t.poorPosture) {
+    constraints.push(
+                     "If poor posture/forward head mentioned: include postural training for awareness, upper back/T-spine strengthening, and pec minor stretching."
+                     );
+  }
+  
+  // Rule 10: Gait
+  if (t.gaitImpairment) {
+    constraints.push(
+                     "If gait impairment/Trendelenburg mentioned: include gait training and education to reduce deviations and improve mechanics with increased step/stride length and improved reciprocal movement (as appropriate)."
+                     );
+  }
+  
+  // If user explicitly requests MT/STM, we should always avoid generic muscle wording
+  if (t.mentionsMT) {
+    constraints.push(
+                     "If MT/STM is mentioned anywhere: avoid generic phrases like 'address muscle tension'; name the specific tissues relevant to the region."
+                     );
+  }
+  
+  return {
+    constraintsText: constraints.join("\n  "),
+    topics: t,
+  };
+}
+
+// Validate the PT visit Summary has muscle specificity for detected topics
+function validatePTVisitSummaryMuscleSpecificity(summary, userText) {
+  const t = detectVisitTopicsFromUserText(userText);
+  const s = String(summary || "");
+  
+  // Shoulder: require any of the required terms (not necessarily all)
+  if (t.shoulderTopic) {
+    const req = ["supraspinatus", "deltoid", "infraspinatus", "teres minor", "teres major", "lat"];
+    if (!mustIncludeAny(s, req)) {
+      return { ok: false, reason: "PT visit summary: shoulder topic requires explicit muscles (supraspinatus, deltoid, infraspinatus, teres minor/major, lats)." };
+    }
+  }
+  
+  // Neck
+  if (t.neckTopic) {
+    const req = ["suboccip", "posterior cervical", "upper trap", "levator", "scm", "pec minor", "lat"];
+    if (!mustIncludeAny(s, req)) {
+      return { ok: false, reason: "PT visit summary: neck topic requires explicit muscles (suboccipitals, posterior cervical, UT, levator scap, SCM, pec minor, lats)." };
+    }
+  }
+  
+  // LBP
+  if (t.lbpTopic) {
+    const req = ["paraspinal", "ql", "multif", "glute med", "tfl", "piriformis", "hamstring"];
+    if (!mustIncludeAny(s, req)) {
+      return { ok: false, reason: "PT visit summary: LBP topic requires explicit muscles (lumbar paraspinals, QL, multifidi, glute med, TFL, piriformis, HS)." };
+    }
+  }
+  
+  // Knee
+  if (t.kneeTopic && t.mentionsMT) {
+    const req = ["it band", "distal quad", "popliteus", "hamstring", "gastroc"];
+    if (!mustIncludeAny(s, req)) {
+      return { ok: false, reason: "PT visit summary: knee + MT topic requires explicit tissues (ITB, distal quads, popliteus, distal HS, proximal medial gastroc)." };
+    }
+  }
+  
+  // Patella hypomobile -> must contain GPM III-IV
+  if (t.patellaHypomobile) {
+    if (!/GPM\s*III-?IV/i.test(s)) {
+      return { ok: false, reason: "PT visit summary: patella hypomobile requires GPM III-IV patellar mobs in all directions." };
+    }
+  }
+  
+  // Core mention -> must mention core activation or abd stabilizers concept
+  if (t.mentionsCore) {
+    if (!includesAny(s, ["core activation", "abd stabil", "trunk stabil", "core stabil"])) {
+      return { ok: false, reason: "PT visit summary: core/abdominal mention requires core activation / abd stabilizer training." };
+    }
+  }
+  
+  // LBP + TherAct mention -> must mention functional training details
+  if (t.lbpTopic && t.mentionsTherAct) {
+    if (!includesAny(s, ["sit-to-stand", "sit to stand", "transfer", "hip hinge", "lifting mechanics", "functional training"])) {
+      return { ok: false, reason: "PT visit summary: LBP + TherAct requires TherAct functional training detail (STS/transfers/hip hinge/lifting mechanics/etc.)." };
+    }
+  }
+  
+  // Posture
+  if (t.poorPosture) {
+    if (!includesAny(s, ["postural", "t-spine", "upper back", "pec minor"])) {
+      return { ok: false, reason: "PT visit summary: posture topic requires postural training + T-spine/upper back strengthening + pec minor stretching." };
+    }
+  }
+  
+  // Gait
+  if (t.gaitImpairment) {
+    if (!includesAny(s, ["gait training", "stride", "step length", "reciprocal"])) {
+      return { ok: false, reason: "PT visit summary: gait impairment requires gait training/education emphasizing step/stride length and reciprocal pattern." };
+    }
+  }
+  
+  return { ok: true };
+}
+
 // ---------------- Routes ----------------
 
 // ✅ Mount aisummary.js ONLY under /api/ai to avoid route collisions.
@@ -596,7 +848,8 @@ ${locallyCleaned}`.trim();
   }
 });
 
-// Visit-note generator
+// Visit-note generator (PT/OT)
+// ✅ Muscle enforcement applies ONLY when discipline === "PT"
 app.post("/generate", async (req, res) => {
   try {
     const patientLabel = String(req.body?.patientLabel || "Patient #1").trim() || "Patient #1";
@@ -629,8 +882,9 @@ app.post("/generate", async (req, res) => {
     });
     
     let out = normalizeNewlines(completion.choices?.[0]?.message?.content || "");
-    const v1 = validateGenerated({ text: out, introPrefix, closerSentence, pocOpener, discipline });
+    let v1 = validateGenerated({ text: out, introPrefix, closerSentence, pocOpener, discipline });
     
+    // First: formatting repair (existing behavior)
     if (!v1.ok) {
       const repairPrompt = buildRepairPrompt({
         patientLabel,
@@ -651,18 +905,82 @@ app.post("/generate", async (req, res) => {
         ],
       });
       
-      const repaired = normalizeNewlines(repair.choices?.[0]?.message?.content || "");
-      const v2 = validateGenerated({ text: repaired, introPrefix, closerSentence, pocOpener, discipline });
+      out = normalizeNewlines(repair.choices?.[0]?.message?.content || "");
+      const v2 = validateGenerated({ text: out, introPrefix, closerSentence, pocOpener, discipline });
       
       if (!v2.ok) {
         return res.status(422).json({
           error: "Model output failed validation after repair.",
           reason1: v1.reason,
           reason2: v2.reason,
-          raw: repaired || out,
+          raw: out,
         });
       }
-      return res.json({ summary: repaired });
+    }
+    
+    // SECOND: PT visit muscle enforcement (NEW)
+    if (discipline === "PT") {
+      const sections = splitSections(out);
+      if (sections) {
+        const { summary } = sections;
+        const vMuscle = validatePTVisitSummaryMuscleSpecificity(summary, userText);
+        
+        if (!vMuscle.ok) {
+          const { constraintsText } = buildPTVisitSummaryMuscleConstraints(userText);
+          
+          const muscleRepairPrompt = buildRepairPrompt({
+            patientLabel,
+            userText,
+            badOutput: out,
+            introPrefix,
+            closerSentence,
+            pocOpener,
+            discipline,
+          extraSummaryConstraints:
+            `${vMuscle.reason}\n  You MUST follow these topic-based content rules if applicable:\n  ${constraintsText}`,
+          });
+          
+          const repair2 = await openai.chat.completions.create({
+            model: MODEL,
+            temperature: 0.15,
+            messages: [
+              { role: "system", content: "Fix content while keeping EXACT format. Do not add facts beyond the user instruction. Output only the corrected note." },
+              { role: "user", content: muscleRepairPrompt },
+            ],
+          });
+          
+          const out2 = normalizeNewlines(repair2.choices?.[0]?.message?.content || out);
+          
+          // Re-validate strict format first
+          const vFmt = validateGenerated({ text: out2, introPrefix, closerSentence, pocOpener, discipline });
+          if (!vFmt.ok) {
+            return res.status(422).json({
+              error: "Muscle enforcement repair broke formatting constraints.",
+              reason: vFmt.reason,
+              raw: out2,
+            });
+          }
+          
+          // Re-check muscles
+          const sections2 = splitSections(out2);
+          const vMuscle2 = sections2
+          ? validatePTVisitSummaryMuscleSpecificity(sections2.summary, userText)
+          : { ok: false, reason: "Could not parse summary after repair." };
+          
+          if (!vMuscle2.ok) {
+            // Return repaired anyway with debug (never hard-fail just for muscles)
+            return res.json({
+              summary: out2,
+              debug: {
+                muscleRuleFail: vMuscle.reason,
+                muscleRuleStillFail: vMuscle2.reason,
+              },
+            });
+          }
+          
+          return res.json({ summary: out2 });
+        }
+      }
     }
     
     return res.json({ summary: out });
@@ -673,11 +991,7 @@ app.post("/generate", async (req, res) => {
 });
 
 // ---------- Eval Template Catalog (for iOS EvaluationView) ----------
-//
-// GET  /eval/templates?discipline=PT
-// GET  /eval/template?discipline=PT&name=...
-// POST /eval/extract
-//
+// (UNCHANGED)
 
 app.get("/eval/templates", (req, res) => {
   const discipline = normalizeDiscipline(req.query?.discipline);
@@ -698,9 +1012,7 @@ app.get("/eval/template", (req, res) => {
   return res.json({ template: mapTemplateToSwiftPayload(t) });
 });
 
-/**
- * /eval/extract (STABLE + OPTIONAL TEMPLATE DEFAULTS)
- */
+// /eval/extract (UNCHANGED)
 app.post("/eval/extract", async (req, res) => {
   try {
     const discipline = normalizeDiscipline(req.body?.discipline);
@@ -897,267 +1209,10 @@ app.post("/eval/extract", async (req, res) => {
 
 // -------------------------------------------------------------------
 // Legacy AI endpoints expected by iOS EvaluationView candidatePaths.
-// These return: { result: "..." } matching your Swift LegacySummaryResponse.
-// Also provided under /api/ai/* as aliases.
+// (UNCHANGED: no muscle enforcement here)
 // -------------------------------------------------------------------
 
-// ---------------- Assessment Summary Rules Engine (PT) ----------------
-
-function joinAllFieldText(fields) {
-  try {
-    return normalizeSpaces(
-                           Object.values(fields || {})
-                           .map((v) => String(v ?? ""))
-                           .join(" ")
-                           );
-  } catch {
-    return "";
-  }
-}
-
-function includesAny(haystack, needles) {
-  const h = String(haystack || "").toLowerCase();
-  return needles.some((n) => h.includes(String(n).toLowerCase()));
-}
-
-// Broadened MT detection and topic detection helpers
-function detectAssessmentTopicsPT(fields) {
-  const all = joinAllFieldText(fields);
-  
-  const subjectiveText = normalizeSpaces(String(fields?.subjective ?? ""));
-  const hasSubjective = subjectiveText.trim().length > 0;
-  
-  const neckTopic = includesAny(all, ["neck pain", "cervical", "c-spine", "c spine", "suboccip", "upper trap", "levator scap", "scm"]);
-  const lbpTopic = includesAny(all, ["lbp", "low back", "lumbar", "l-spine", "l spine", "radicul", "sciatica", "paraspinal", "ql"]);
-  const shoulderTopic = includesAny(all, ["shoulder pain", "gh", "glenohumeral", "rtc", "rotator cuff", "impingement", "supraspinatus", "infraspinatus", "deltoid"]);
-  const kneeTopic = includesAny(all, ["knee pain", "knee oa", "tka", "patella", "patellar", "it band", "quad", "hamstring", "gastroc", "popliteus"]);
-  
-  const mentionsMT = includesAny(all, [
-    " mt ",
-    "mt,",
-    "mt.",
-    "manual therapy",
-    "manual tx",
-    "stm",
-    "soft tissue",
-    "iastm",
-  ]);
-  
-  const mentionsTherAct = includesAny(all, [
-    "theract",
-    "ther-act",
-    "ther act",
-    "functional training",
-    "functional task",
-    "lifting",
-    "sit-to-stand",
-    "sit to stand",
-    "sts",
-    "transfer",
-    "transfers",
-  ]);
-  
-  const mentionsCore = includesAny(all, [
-    "core",
-    "abdominal",
-    "abd",
-    "trunk stability",
-    "stabilizer",
-    "stabilizers",
-    "ta activation",
-    "transverse abdominis",
-  ]);
-  
-  const patellaHypomobile = includesAny(all, [
-    "patella hypomobile",
-    "patellar hypomobile",
-    "hypomobile patella",
-    "patellar mobility limited",
-  ]);
-  
-  const poorPosture = includesAny(all, [
-    "poor posture",
-    "forward head",
-    "forward head lean",
-    "rounded shoulders",
-    "kyphosis",
-    "scapular protraction",
-  ]);
-  
-  const gaitImpairment = includesAny(all, [
-    "abnormal gait",
-    "impaired gait",
-    "trendelenburg",
-    "antalgic",
-    "shuffling",
-    "decreased stride",
-    "decreased step",
-    "gait deviation",
-  ]);
-  
-  return {
-    hasSubjective,
-    neckTopic,
-    lbpTopic,
-    shoulderTopic,
-    kneeTopic,
-    mentionsMT,
-    mentionsTherAct,
-    mentionsCore,
-    patellaHypomobile,
-    poorPosture,
-    gaitImpairment,
-  };
-}
-
-function buildAssessmentSummaryRulesPT(fields) {
-  const t = detectAssessmentTopicsPT(fields);
-  
-  const rules = [
-    'Use "Pt" only; do not use "the patient" or they/their/them/theirs/themselves.',
-    "No arrows (↑ ↓). No bullets or numbering.",
-    "Do not invent diagnoses, devices, test results, or measurements that are not present in fields.",
-    "Avoid generic phrasing like 'MT to address back muscles.' If describing MT/STM/stretching, name the individual muscle groups explicitly.",
-    "Write as one paragraph, 5–7 sentences.",
-  ];
-  
-  // 1) Subjective missing: synthesize a Pt statement consistent with provided fields
-  if (!t.hasSubjective) {
-    rules.push(
-               "Subjective is missing: you MUST include ONE realistic patient-reported statement consistent with the provided findings and functional limits (based on the fields). Do not add new diagnoses; keep it faithful."
-               );
-  }
-  
-  // 2) Neck
-  if (t.neckTopic) {
-    rules.push(
-               "Neck topic: you MUST explicitly name these tissues (do not generalize): suboccipitals, posterior cervical musculature, UT, levator scap, SCM, pec minor, and lats. Include STM to release suboccipitals/posterior neck/UT/levator scap. Include manual stretching emphasizing SCM release/stretch, pec minor stretch, lat stretch, and UT/levator scap stretch."
-               );
-  }
-  
-  // 3) LBP
-  if (t.lbpTopic) {
-    rules.push(
-               "LBP topic: you MUST explicitly name these tissues (do not generalize): lumbar paraspinals, QL, multifidi, glute med, TFL, and piriformis. Include STM to reduce muscle tension to lumbar paraspinals/QL/multifidi/glute med/TFL/piriformis. Include manual stretching to HS, glute med, TFL, and piriformis."
-               );
-  }
-  
-  // 4) Core
-  if (t.mentionsCore) {
-    rules.push(
-               "Core/abdominal mention: include that core and abd stabilizers are addressed via core activation techniques and TherEx targeting trunk stabilization."
-               );
-  }
-  
-  // 5) TherAct for LBP
-  if (t.lbpTopic && t.mentionsTherAct) {
-    rules.push(
-               "LBP with TherAct: include TherAct functional training consistent with fields (e.g., sit-to-stand mechanics, transfer training, hip hinge/lifting mechanics, gait-related functional tasks). Do not invent assist levels or devices."
-               );
-  }
-  
-  // 6) Shoulder + MT mention OR shoulder topic alone (still enforce muscle naming)
-  if (t.shoulderTopic) {
-    rules.push(
-               "Shoulder topic: you MUST explicitly name these muscles (do not generalize as 'shoulder region/muscles'): supraspinatus, deltoid, infraspinatus, teres minor, teres major, and lats. If MT/STM is referenced, phrase it as STM/MT to release those specific tissues."
-               );
-  }
-  
-  // 7) Knee + MT mention OR knee topic alone (still enforce muscle naming)
-  if (t.kneeTopic) {
-    rules.push(
-               "Knee topic: you MUST explicitly name these tissues when describing MT/STM (do not generalize): IT band, distal quads, popliteus, distal medial/lateral HS, and proximal medial gastroc."
-               );
-  }
-  
-  // 8) Patella hypomobile -> GPM III-IV
-  if (t.patellaHypomobile) {
-    rules.push(
-               "Patella hypomobile: include patellar joint mobilization using GPM III-IV in all directions to improve mobility and decrease pain."
-               );
-  }
-  
-  // 9) Posture
-  if (t.poorPosture) {
-    rules.push(
-               "Posture impairment: include postural training to improve awareness, upper back and T-spine strengthening, and pec minor stretching to improve posture."
-               );
-  }
-  
-  // 10) Gait
-  if (t.gaitImpairment) {
-    rules.push(
-               "Gait impairment: include gait training/education to reduce deviations and improve gait mechanics, emphasizing increased step length/stride length and improved reciprocal movement as appropriate."
-               );
-  }
-  
-  rules.push('Use PT abbreviations where appropriate (STM, TherEx, TherAct, HEP, ADLs, GPM).');
-  
-  return rules;
-}
-
-// ---------------- Muscle Specificity Validator + Repair ----------------
-
-function mustIncludeAny(summary, terms) {
-  const s = String(summary || "").toLowerCase();
-  return terms.some((t) => s.includes(String(t).toLowerCase()));
-}
-
-function validateMuscleSpecificityPT(summaryText, fields) {
-  const t = detectAssessmentTopicsPT(fields);
-  const txt = String(summaryText || "");
-  
-  // Enforce "at least one of the required list" for each topic present
-  if (t.shoulderTopic) {
-    const req = ["supraspinatus", "deltoid", "infraspinatus", "teres minor", "teres major", "lat"];
-    if (!mustIncludeAny(txt, req)) {
-      return {
-        ok: false,
-      reason:
-        "Shoulder topic requires explicit muscle names (supraspinatus, deltoid, infraspinatus, teres minor/major, lats).",
-      };
-    }
-  }
-  
-  if (t.neckTopic) {
-    const req = ["suboccip", "posterior cervical", "upper trap", "levator", "scm", "pec minor", "lat"];
-    if (!mustIncludeAny(txt, req)) {
-      return {
-        ok: false,
-      reason:
-        "Neck topic requires explicit tissue names (suboccipitals, posterior cervical, UT, levator scap, SCM, pec minor, lats).",
-      };
-    }
-  }
-  
-  if (t.lbpTopic) {
-    const req = ["paraspinal", "ql", "multif", "glute med", "tfl", "piriformis", "hamstring"];
-    if (!mustIncludeAny(txt, req)) {
-      return {
-        ok: false,
-      reason:
-        "LBP topic requires explicit tissue names (lumbar paraspinals, QL, multifidi, glute med, TFL, piriformis, HS).",
-      };
-    }
-  }
-  
-  if (t.kneeTopic) {
-    const req = ["it band", "distal quad", "popliteus", "hamstring", "gastroc"];
-    if (!mustIncludeAny(txt, req)) {
-      return {
-        ok: false,
-      reason:
-        "Knee topic requires explicit tissue names (ITB, distal quads, popliteus, distal HS, proximal medial gastroc).",
-      };
-    }
-  }
-  
-  return { ok: true };
-}
-
-// ---------------- Legacy text AI runner ----------------
-
-async function runSimpleTextAI({ purpose, fields, discipline, extraRules = [] }) {
+async function runSimpleTextAI({ purpose, fields, discipline }) {
   const safeDiscipline = normalizeDiscipline(discipline);
   
   const sys =
@@ -1172,7 +1227,6 @@ async function runSimpleTextAI({ purpose, fields, discipline, extraRules = [] })
       'Use "Pt" only; do not use "the patient" or third-person pronouns.',
       "No bullets/numbering. No arrows.",
       "Only use details present in fields; if missing, be general rather than inventing.",
-      ...(Array.isArray(extraRules) ? extraRules : []),
     ],
     fields,
     output: "Return only the text (no JSON, no headers).",
@@ -1245,55 +1299,13 @@ async function handlePTDiffDx(req, res) {
 async function handlePTSummary(req, res) {
   try {
     const fields = buildFieldsMap(req.body);
-    
-    const assessmentRules = buildAssessmentSummaryRulesPT(fields);
-    
-    let result = await runSimpleTextAI({
+    const result = await runSimpleTextAI({
     purpose:
-      "Generate an Assessment Summary paragraph for a PT evaluation. 5–7 sentences in ONE paragraph. " +
+      "Generate an Assessment Summary paragraph for a PT evaluation. 5–7 sentences. " +
       "Use PT abbreviations where appropriate. Do not include SOAP headers.",
       fields,
       discipline: "PT",
-      extraRules: assessmentRules,
     });
-    
-    // -------- NEW: enforce muscle specificity + auto repair ----------
-    const v1 = validateMuscleSpecificityPT(result, fields);
-    if (!v1.ok) {
-      const repairPrompt = `
-Rewrite the paragraph to comply WITHOUT adding new facts:
-- Keep 5–7 sentences, one paragraph, no bullets, no arrows.
-- Use "Pt" only (no they/their).
-- You MUST explicitly name the relevant muscles for the detected topic(s) instead of general terms like "shoulder region" or "back muscles".
-- Maintain the same meaning as the original.
-
-Detected requirement:
-${v1.reason}
-
-Original:
-${result}
-
-Now output the corrected paragraph only.
-`.trim();
-      
-      const repaired = await openai.chat.completions.create({
-        model: MODEL,
-        temperature: 0.1,
-        messages: [
-          { role: "system", content: "You are a PT documentation assistant. Do not invent facts." },
-          { role: "user", content: repairPrompt },
-        ],
-      });
-      
-      const repairedText = normalizeSpaces(repaired.choices?.[0]?.message?.content || result);
-      
-      const v2 = validateMuscleSpecificityPT(repairedText, fields);
-      if (v2.ok) return res.json({ result: repairedText });
-      
-      // If still fails, return repaired anyway + debug so you can see why
-      return res.json({ result: repairedText, debug: { muscleRuleFail: v1.reason } });
-    }
-    
     return res.json({ result });
   } catch (err) {
     console.error("❌ pt_generate_summary failed", err?.message || err);
