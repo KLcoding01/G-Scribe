@@ -8,6 +8,11 @@
 // 3) OPTIONAL: templateDefaults mode (fills missing fields from your selected template baseline,
 //    NOT from hallucination). This is how you get “your sample format values” without guessing.
 //
+// NEW (Assessment Summary rules):
+// - If Subjective missing: generate a plausible Pt statement consistent with cues
+// - Topic-driven inclusions for neck/LBP/shoulder/knee/core/posture/gait/patella hypomobile
+// - Conservative enforcement + repair pass if required inclusions missing
+//
 // ESM module (package.json should include: { "type": "module" })
 
 import express from "express";
@@ -150,9 +155,12 @@ const SUMMARY_INTRO_PREFIXES = [
   "Pt demonstrates ",
   "Pt displays ",
   "Pt shows ",
+  "Pt completes",
+  "Therapy tx focuses on",
   "During today's tx, pt ",
   "Pt continues ",
   "Pt presents ",
+  "Assessment displays",
   "Tx focused on ",
   "Functional mobility indicates pt ",
 ];
@@ -255,7 +263,6 @@ function getTemplatesForDiscipline(discipline) {
 }
 
 const TEMPLATE_KEYMAP = {
-  bmi_category: "bmiCategory",
   pain_location: "painLocation",
   pain_onset: "painOnset",
   pain_condition: "painCondition",
@@ -375,6 +382,9 @@ const SUBJECTIVE_STARTERS = [
   "Pt states",
   "Pt notes",
   "Pt c/o",
+  "Pt c/c of",
+  "Pt verbalizes",
+  "Pt expresses",
   "Pt denies",
   "Pt agrees",
   "Pt confirms",
@@ -511,8 +521,7 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
   if (hasBannedThirdPersonRef(summary))
     return {
       ok: false,
-    reason:
-      'Summary must not contain "The patient" or third-person pronouns. Use "Pt" only.',
+      reason: 'Summary must not contain "The patient" or third-person pronouns. Use "Pt" only.',
     };
   
   if (hasBannedGenericSummaryStart(summary))
@@ -545,7 +554,42 @@ function validateGenerated({ text, introPrefix, closerSentence, pocOpener, disci
   return { ok: true };
 }
 
-// ---------------- Routes ----------------
+// ---------------- NEW: Assessment Summary rule engine helpers ----------------
+
+function detectTopicFlags(fields) {
+  const all = Object.values(fields || {})
+  .map((v) => String(v || ""))
+  .join(" ")
+  .toLowerCase();
+  
+  const has = (re) => re.test(all);
+  
+  return {
+    neck: has(/\bneck\b|\bcervic\b|\bsuboccip\b/),
+    lowBack: has(/\blbp\b|\blow back\b|\blumbar\b|\bl-?spine\b/),
+    shoulder: has(/\bshoulder\b|\brtc\b|\brotator cuff\b/),
+    knee: has(/\bknee\b|\bpatell\b|\btka\b|\boa\b/),
+    
+    mt: has(/\bmt\b|\bmanual\b|\bmanual therapy\b|\bsoft tissue\b|\bstm\b|\bmobiliz\b/),
+    therAct: has(/\btheract\b|\bther-act\b|\bther act\b|\bfunctional training\b/),
+    
+    coreOrAbd: has(/\bcore\b|\babd\b|\babdominal\b|\btrunk\b/),
+    
+    poorPosture: has(/\bpoor posture\b|\bforward head\b|\bfwd head\b|\bforward head lean\b/),
+    gaitImpairment: has(/\babnormal gait\b|\bimpaired gait\b|\btrendelenburg\b|\bshuffling\b|\bgait deviation\b/),
+    
+    patellaHypo: has(/\bpatella\b.*\bhypomob/i) || has(/\bhypomob.*\bpatella/i),
+  };
+}
+
+function isEmptySubjective(fields) {
+  const s = String(fields?.subjective || "").trim();
+  return !s;
+}
+
+// -------------------------------------------------------------------
+// Routes
+// -------------------------------------------------------------------
 
 // ✅ Mount aisummary.js ONLY under /api/ai to avoid route collisions.
 app.use("/api/ai", aiRouter);
@@ -732,13 +776,6 @@ app.post("/eval/extract", async (req, res) => {
     
     // ✅ Allowed patch keys = Swift EvalFormPatch keys (camelCase)
     const allowedKeys = [
-      "gender",
-      "dob",
-      "weight",
-      "height",
-      "bmi",
-      "bmiCategory",
-      
       "meddiag",
       "history",
       "subjective",
@@ -927,7 +964,7 @@ app.post("/eval/extract", async (req, res) => {
 // Also provided under /api/ai/* as aliases.
 // -------------------------------------------------------------------
 
-async function runSimpleTextAI({ purpose, fields, discipline }) {
+async function runSimpleTextAI({ purpose, fields, discipline, extraRules = [] }) {
   const safeDiscipline = normalizeDiscipline(discipline);
   
   const sys =
@@ -942,6 +979,7 @@ async function runSimpleTextAI({ purpose, fields, discipline }) {
       'Use "Pt" only; do not use "the patient" or third-person pronouns.',
       "No bullets/numbering. No arrows.",
       "Only use details present in fields; if missing, be general rather than inventing.",
+      ...extraRules,
     ],
     fields,
     output: "Return only the text (no JSON, no headers).",
@@ -1011,16 +1049,179 @@ async function handlePTDiffDx(req, res) {
   }
 }
 
+// ---------------- UPDATED: PT Assessment Summary with your 10 rules ----------------
+
 async function handlePTSummary(req, res) {
   try {
     const fields = buildFieldsMap(req.body);
+    const flags = detectTopicFlags(fields);
+    const missingSubj = isEmptySubjective(fields);
+    
+    const requiredInclusions = [];
+    
+    // 1) If subjective missing: fabricate a Pt statement consistent with cues (controlled)
+    if (missingSubj) {
+      requiredInclusions.push(
+                              "If fields.subjective is missing/blank, you MUST create exactly one patient-reported sentence (start with 'Pt reports' or 'Pt states') that is plausible and derived from the provided fields. " +
+                              "This sentence must NOT introduce new diagnoses, new numbers, new devices, or new PMH; it must be consistent with existing cues."
+                              );
+    }
+    
+    // 2) Neck pain topic
+    if (flags.neck) {
+      requiredInclusions.push(
+                              "If neck/cervical topic is present, include STM to release suboccipitals, posterior neck mm, and UT/levator scap. " +
+                              "Include manual stretching focused on SCM release stretch, pec minor stretch, lats stretch, and UT/levator scap stretch."
+                              );
+    }
+    
+    // 3) LBP topic
+    if (flags.lowBack) {
+      requiredInclusions.push(
+                              "If LBP/low back topic is present, include STM to release L-spine paraspinals, QL, multifidi, glute med, TFL, and piriformis. " +
+                              "Include manual stretching to HS, glute med, TFL, and piriformis."
+                              );
+    }
+    
+    // 4) Core/abd mention
+    if (flags.coreOrAbd) {
+      requiredInclusions.push(
+                              "If core/abdominal mm are mentioned, include that core and abd stabilizers were addressed via core activation techniques and TherEx to improve trunk stability/control."
+                              );
+    }
+    
+    // 5) TherAct mention for LBP
+    if (flags.lowBack && flags.therAct) {
+      requiredInclusions.push(
+                              "If TherAct is mentioned in context of LBP, include functional TherAct training relevant to LBP (e.g., sit↔stand mechanics, hip hinge/squat pattern, transfers, lifting mechanics, bed mobility, gait-related functional tasks) to improve ADL tolerance."
+                              );
+    }
+    
+    // 6) Shoulder pain + MT mentioned
+    if (flags.shoulder && flags.mt) {
+      requiredInclusions.push(
+                              "If shoulder pain and MT are present, include STM to release supraspinatus, deltoid, infraspinatus, teres minor/major, and lats tension."
+                              );
+    }
+    
+    // 7) Knee pain + MT mentioned
+    if (flags.knee && flags.mt) {
+      requiredInclusions.push(
+                              "If knee pain and MT are present, include STM to release ITB, distal quads, popliteus, medial/lateral distal HS, and proximal medial gastroc."
+                              );
+    }
+    
+    // 8) Patella hypomobile
+    if (flags.patellaHypo) {
+      requiredInclusions.push(
+                              "If patella hypomobility is mentioned, include patellar joint mobilization using GPM III-IV in all directions to decrease pain and improve mobility."
+                              );
+    }
+    
+    // 9) Poor posture / forward head
+    if (flags.poorPosture) {
+      requiredInclusions.push(
+                              "If poor posture or forward head posture is mentioned, include postural training to improve awareness and address upper back mm and T-spine strengthening, plus pec minor stretching to improve posture."
+                              );
+    }
+    
+    // 10) Gait impairments / Trendelenburg
+    if (flags.gaitImpairment) {
+      requiredInclusions.push(
+                              "If abnormal/impaired gait or Trendelenburg is mentioned, include gait training/education to decrease deviations and improve gait mechanics (increase step/stride length and improve reciprocal movement pattern)."
+                              );
+    }
+    
+    // Primary generation
     const result = await runSimpleTextAI({
     purpose:
-      "Generate an Assessment Summary paragraph for a PT evaluation. 5–7 sentences. " +
+      "Generate an Assessment Summary paragraph for a PT evaluation. 5–7 sentences in one paragraph. " +
       "Use PT abbreviations where appropriate. Do not include SOAP headers.",
       fields,
       discipline: "PT",
+      extraRules: [
+        "Output must be 5–7 sentences in one paragraph.",
+        "No bullets/numbering, no arrows.",
+        'Use "Pt" only; do not use "the patient" or they/their.',
+        "Do not invent facts beyond the provided fields.",
+        ...requiredInclusions,
+      ],
     });
+    
+    // If subjective missing: enforce presence of Pt statement (one repair pass)
+    if (missingSubj) {
+      const hasPtStatement = /\bpt\s+(reports|states|notes|c\/o|c\/c|verbalizes|expresses|denies|agrees|confirms)\b/i.test(
+                                                                                                                           result
+                                                                                                                           );
+      if (!hasPtStatement) {
+        const repairPrompt = `
+Rewrite this PT Assessment Summary to include exactly ONE patient-reported sentence starting with "Pt reports" (or similar) that is consistent with the current content. Keep 5–7 sentences. Do NOT add new facts.
+
+Summary:
+${result}
+
+Return corrected summary only.
+`.trim();
+        
+        const repair = await openai.chat.completions.create({
+          model: MODEL,
+          temperature: 0.1,
+          messages: [
+            {
+              role: "system",
+            content:
+              'You are a PT clinical documentation assistant. Use "Pt" only, no bullets, no arrows, do not invent facts.',
+            },
+            { role: "user", content: repairPrompt },
+          ],
+        });
+        
+        const repaired = normalizeSpaces(repair.choices?.[0]?.message?.content || result);
+        return res.json({ result: repaired });
+      }
+    }
+    
+    // Conservative inclusion enforcement: check for a few signature tokens; repair only if missing
+    const mustHaveTokens = [];
+    if (flags.neck) mustHaveTokens.push("suboccip");
+    if (flags.lowBack) mustHaveTokens.push("ql");
+    if (flags.shoulder && flags.mt) mustHaveTokens.push("supraspin");
+    if (flags.knee && flags.mt) mustHaveTokens.push("itb");
+    if (flags.patellaHypo) mustHaveTokens.push("gpm");
+    if (flags.poorPosture) mustHaveTokens.push("t-spine");
+    if (flags.gaitImpairment) mustHaveTokens.push("stride");
+    
+    const missingTokens = mustHaveTokens.filter((tok) => !result.toLowerCase().includes(tok));
+    if (requiredInclusions.length && missingTokens.length) {
+      const enforcePrompt = `
+Revise this PT Assessment Summary to include the required inclusions below. Keep 5–7 sentences in one paragraph. No bullets/numbering. No arrows. Use "Pt" only. Do NOT add new diagnoses, new numbers, new devices, or new PMH.
+
+Required inclusions:
+- ${requiredInclusions.join("\n- ")}
+
+Current summary:
+${result}
+
+Return revised summary only.
+`.trim();
+      
+      const repair2 = await openai.chat.completions.create({
+        model: MODEL,
+        temperature: 0.1,
+        messages: [
+          {
+            role: "system",
+          content:
+            'You are a PT clinical documentation assistant. Use "Pt" only, no bullets, no arrows, do not invent facts.',
+          },
+          { role: "user", content: enforcePrompt },
+        ],
+      });
+      
+      const revised = normalizeSpaces(repair2.choices?.[0]?.message?.content || result);
+      return res.json({ result: revised });
+    }
+    
     return res.json({ result });
   } catch (err) {
     console.error("❌ pt_generate_summary failed", err?.message || err);
