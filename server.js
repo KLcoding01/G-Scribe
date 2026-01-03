@@ -1,19 +1,12 @@
-// ======================= server.js (FULL, UPDATED) =======================
-// server.js (DROP-IN, FULLY UPDATED)
-// PT/OT Summary backend + PT/OT Eval Builder endpoints for iOS client (SwiftUI)
+// ======================= server.js (FULL, UPDATED + MUSCLE ENFORCEMENT) =======================
+// DROP-IN server.js
 //
-// Key upgrades for Conversational AI stability:
-// 1) Evidence-gated extraction output (patch + evidence + debug)
-// 2) Deterministic merge server-side (fill_empty | smart | overwrite)
-// 3) OPTIONAL: templateDefaults mode (fills missing fields from your selected template baseline,
-//    NOT from hallucination). This is how you get “your sample format values” without guessing.
+// What’s new in THIS version (your requested fix):
+// 1) Assessment Summary rules are now HARD “must include” for specific muscles by topic.
+// 2) Server-side validator checks the generated PT assessment summary includes required muscle names.
+// 3) If missing, the server runs an automatic REPAIR pass to force muscle specificity (no new facts).
 //
-// NEW (Assessment Summary Rules Engine):
-// - Topic-aware required inclusions (neck/LBP/shoulder/knee/posture/gait/core/TherAct rules)
-// - If Subjective is missing, model will synthesize a Pt statement consistent with provided findings
-// - Forces specific muscle naming (no “back muscles” generic phrasing)
-//
-// ESM module (package.json should include: { "type": "module" })
+// NOTE: This targets PT eval Assessment Summary endpoint: /pt_generate_summary (and /api/ai/pt_generate_summary)
 
 import express from "express";
 import cors from "cors";
@@ -707,23 +700,6 @@ app.get("/eval/template", (req, res) => {
 
 /**
  * /eval/extract (STABLE + OPTIONAL TEMPLATE DEFAULTS)
- *
- * Request body:
- * {
- *   discipline: "PT"|"OT",
- *   templateName: "Knee - OA" (optional but recommended),
- *   transcript: string,
- *   currentForm: object (optional),
- *   mergeMode: "fill_empty"|"smart"|"overwrite" (optional),
- *   useTemplateDefaults: true|false (optional, default false)
- * }
- *
- * Behavior:
- * - Extract patch ONLY from transcript (evidence-gated)
- * - Merge deterministically on server
- * - If useTemplateDefaults=true and templateName exists:
- *      base = templateBaseline merged with currentForm
- *      (this fills your “sample format” fields from the template, not hallucination)
  */
 app.post("/eval/extract", async (req, res) => {
   try {
@@ -740,7 +716,6 @@ app.post("/eval/extract", async (req, res) => {
       return res.status(400).json({ error: "transcript is required." });
     }
     
-    // ✅ Allowed patch keys = Swift EvalFormPatch keys (camelCase)
     const allowedKeys = [
       "gender",
       "dob",
@@ -784,7 +759,6 @@ app.post("/eval/extract", async (req, res) => {
       "intervention",
       "procedures",
       
-      // SOAP extraction support
       "soapPainLine",
       "soapRom",
       "soapPalpation",
@@ -792,7 +766,6 @@ app.post("/eval/extract", async (req, res) => {
       "soapGoals",
     ];
     
-    // Template baseline (OPTIONAL)
     let templateBaseline = null;
     if (templateName) {
       const templates = getTemplatesForDiscipline(discipline);
@@ -801,9 +774,6 @@ app.post("/eval/extract", async (req, res) => {
       }
     }
     
-    // Base form (what we merge into):
-    // - if useTemplateDefaults: start with templateBaseline, then overlay currentForm
-    // - else: start with currentForm only
     const baseForm = useTemplateDefaults
     ? { ...(templateBaseline || {}), ...(currentForm || {}) }
     : { ...(currentForm || {}) };
@@ -814,7 +784,6 @@ app.post("/eval/extract", async (req, res) => {
     "Do NOT invent facts. Do NOT output any prose. " +
     'Use PT-style abbreviations and always use "Pt".';
     
-    // Evidence-gated schema: forces “why” for each fill
     const user = {
       discipline,
       mergeMode,
@@ -864,17 +833,14 @@ app.post("/eval/extract", async (req, res) => {
     : {};
     const debug = Array.isArray(obj.debug) ? obj.debug : [];
     
-    // ---------------- HARD ANTI-HALLUCINATION GATE ----------------
-    // Require evidence for every filled field; if missing, drop it.
     const gatedPatch = {};
     for (const k of Object.keys(rawPatch)) {
       const ev = toCleanString(evidence?.[k]);
-      if (!ev) continue; // evidence required
-      if (ev.length < 8) continue; // too short = usually not a real quote
+      if (!ev) continue;
+      if (ev.length < 8) continue;
       gatedPatch[k] = rawPatch[k];
     }
     
-    // Deterministic merge (server decides)
     const merged = applyMerge({
       base: baseForm,
       patch: gatedPatch,
@@ -882,7 +848,6 @@ app.post("/eval/extract", async (req, res) => {
       allowedKeys,
     });
     
-    // Return ONLY changed keys vs baseForm (stable patch semantics for iOS)
     const patchOut = {};
     for (const k of allowedKeys) {
       const before = toCleanString(baseForm?.[k]);
@@ -890,7 +855,6 @@ app.post("/eval/extract", async (req, res) => {
       if (after && after !== before) patchOut[k] = after;
     }
     
-    // Never hard-fail on empty patch
     if (Object.keys(patchOut).length === 0) {
       return res.json({
         patch: {},
@@ -956,24 +920,80 @@ function includesAny(haystack, needles) {
   return needles.some((n) => h.includes(String(n).toLowerCase()));
 }
 
+// Broadened MT detection and topic detection helpers
 function detectAssessmentTopicsPT(fields) {
   const all = joinAllFieldText(fields);
   
   const subjectiveText = normalizeSpaces(String(fields?.subjective ?? ""));
   const hasSubjective = subjectiveText.trim().length > 0;
   
-  const neckTopic = includesAny(all, ["neck pain", "cervical", "c-spine", "c spine", "suboccip", "upper trap", "levator scap"]);
-  const lbpTopic = includesAny(all, ["lbp", "low back", "lumbar", "l-spine", "l spine", "radicul", "sciatica"]);
-  const shoulderTopic = includesAny(all, ["shoulder pain", "gh", "glenohumeral", "rtc", "rotator cuff", "impingement", "deltoid"]);
+  const neckTopic = includesAny(all, ["neck pain", "cervical", "c-spine", "c spine", "suboccip", "upper trap", "levator scap", "scm"]);
+  const lbpTopic = includesAny(all, ["lbp", "low back", "lumbar", "l-spine", "l spine", "radicul", "sciatica", "paraspinal", "ql"]);
+  const shoulderTopic = includesAny(all, ["shoulder pain", "gh", "glenohumeral", "rtc", "rotator cuff", "impingement", "supraspinatus", "infraspinatus", "deltoid"]);
   const kneeTopic = includesAny(all, ["knee pain", "knee oa", "tka", "patella", "patellar", "it band", "quad", "hamstring", "gastroc", "popliteus"]);
   
-  const mentionsMT = includesAny(all, [" mt ", "mt,", "manual therapy", "stm", "soft tissue"]);
-  const mentionsTherAct = includesAny(all, ["theract", "ther-act", "ther act", "functional training", "functional task", "lifting", "sit-to-stand", "sts", "transfer"]);
-  const mentionsCore = includesAny(all, ["core", "abdominal", "abd", "trunk stability", "stabilizer", "ta activation", "transverse abdominis"]);
+  const mentionsMT = includesAny(all, [
+    " mt ",
+    "mt,",
+    "mt.",
+    "manual therapy",
+    "manual tx",
+    "stm",
+    "soft tissue",
+    "iastm",
+  ]);
   
-  const patellaHypomobile = includesAny(all, ["patella hypomobile", "patellar hypomobile", "hypomobile patella", "patellar mobility limited"]);
-  const poorPosture = includesAny(all, ["poor posture", "forward head", "forward head lean", "rounded shoulders", "kyphosis", "scapular protraction"]);
-  const gaitImpairment = includesAny(all, ["abnormal gait", "impaired gait", "trendelenburg", "antalgic", "shuffling", "decreased stride", "decreased step", "gait deviation"]);
+  const mentionsTherAct = includesAny(all, [
+    "theract",
+    "ther-act",
+    "ther act",
+    "functional training",
+    "functional task",
+    "lifting",
+    "sit-to-stand",
+    "sit to stand",
+    "sts",
+    "transfer",
+    "transfers",
+  ]);
+  
+  const mentionsCore = includesAny(all, [
+    "core",
+    "abdominal",
+    "abd",
+    "trunk stability",
+    "stabilizer",
+    "stabilizers",
+    "ta activation",
+    "transverse abdominis",
+  ]);
+  
+  const patellaHypomobile = includesAny(all, [
+    "patella hypomobile",
+    "patellar hypomobile",
+    "hypomobile patella",
+    "patellar mobility limited",
+  ]);
+  
+  const poorPosture = includesAny(all, [
+    "poor posture",
+    "forward head",
+    "forward head lean",
+    "rounded shoulders",
+    "kyphosis",
+    "scapular protraction",
+  ]);
+  
+  const gaitImpairment = includesAny(all, [
+    "abnormal gait",
+    "impaired gait",
+    "trendelenburg",
+    "antalgic",
+    "shuffling",
+    "decreased stride",
+    "decreased step",
+    "gait deviation",
+  ]);
   
   return {
     hasSubjective,
@@ -993,7 +1013,6 @@ function detectAssessmentTopicsPT(fields) {
 function buildAssessmentSummaryRulesPT(fields) {
   const t = detectAssessmentTopicsPT(fields);
   
-  // Base global rules (always on)
   const rules = [
     'Use "Pt" only; do not use "the patient" or they/their/them/theirs/themselves.',
     "No arrows (↑ ↓). No bullets or numbering.",
@@ -1002,81 +1021,141 @@ function buildAssessmentSummaryRulesPT(fields) {
     "Write as one paragraph, 5–7 sentences.",
   ];
   
-  // Rule 1: If Subjective missing, synthesize a Pt statement based on content available
+  // 1) Subjective missing: synthesize a Pt statement consistent with provided fields
   if (!t.hasSubjective) {
     rules.push(
-               "Subjective field is missing: you MUST synthesize ONE realistic patient-reported statement consistent with the provided findings (e.g., pain location, functional limits) and include it early in the paragraph. Do not add new diagnoses; keep it faithful to the impairments and functional limits present."
+               "Subjective is missing: you MUST include ONE realistic patient-reported statement consistent with the provided findings and functional limits (based on the fields). Do not add new diagnoses; keep it faithful."
                );
   }
   
-  // Rule 2: Neck pain block (STM + stretches + specific muscles)
+  // 2) Neck
   if (t.neckTopic) {
     rules.push(
-               "Neck topic detected: include STM to release suboccipital region, posterior cervical musculature, UT, and levator scap. Include manual stretching emphasizing SCM release/stretch, pec minor stretch, lat stretch, and UT/levator scap stretch."
+               "Neck topic: you MUST explicitly name these tissues (do not generalize): suboccipitals, posterior cervical musculature, UT, levator scap, SCM, pec minor, and lats. Include STM to release suboccipitals/posterior neck/UT/levator scap. Include manual stretching emphasizing SCM release/stretch, pec minor stretch, lat stretch, and UT/levator scap stretch."
                );
   }
   
-  // Rule 3: LBP block (STM + stretches + specific muscles)
+  // 3) LBP
   if (t.lbpTopic) {
     rules.push(
-               "LBP/low back topic detected: include STM to reduce muscle tension to lumbar paraspinals, QL, multifidi, glute med, TFL, and piriformis. Include manual stretching to HS, glute med, TFL, and piriformis."
+               "LBP topic: you MUST explicitly name these tissues (do not generalize): lumbar paraspinals, QL, multifidi, glute med, TFL, and piriformis. Include STM to reduce muscle tension to lumbar paraspinals/QL/multifidi/glute med/TFL/piriformis. Include manual stretching to HS, glute med, TFL, and piriformis."
                );
   }
   
-  // Rule 4: Core/abdominal mention
+  // 4) Core
   if (t.mentionsCore) {
     rules.push(
-               "Core/abdominal mention detected: include that core and abd stabilizers are addressed via core activation techniques and TherEx targeting trunk stabilization."
+               "Core/abdominal mention: include that core and abd stabilizers are addressed via core activation techniques and TherEx targeting trunk stabilization."
                );
   }
   
-  // Rule 5: TherAct mention for LBP
+  // 5) TherAct for LBP
   if (t.lbpTopic && t.mentionsTherAct) {
     rules.push(
-               "LBP with TherAct mention detected: include TherAct functional training (examples: sit-to-stand mechanics, transfer training, hip hinge/lifting mechanics, gait-related functional tasks) tailored to deficits present; keep it consistent with provided fields."
+               "LBP with TherAct: include TherAct functional training consistent with fields (e.g., sit-to-stand mechanics, transfer training, hip hinge/lifting mechanics, gait-related functional tasks). Do not invent assist levels or devices."
                );
   }
   
-  // Rule 6: Shoulder pain + MT mention
-  if (t.shoulderTopic && t.mentionsMT) {
+  // 6) Shoulder + MT mention OR shoulder topic alone (still enforce muscle naming)
+  if (t.shoulderTopic) {
     rules.push(
-               "Shoulder pain with MT/STM mention detected: include STM to release supraspinatus, deltoid, infraspinatus, teres minor/major, and lat tension."
+               "Shoulder topic: you MUST explicitly name these muscles (do not generalize as 'shoulder region/muscles'): supraspinatus, deltoid, infraspinatus, teres minor, teres major, and lats. If MT/STM is referenced, phrase it as STM/MT to release those specific tissues."
                );
   }
   
-  // Rule 7: Knee pain + MT mention
-  if (t.kneeTopic && t.mentionsMT) {
+  // 7) Knee + MT mention OR knee topic alone (still enforce muscle naming)
+  if (t.kneeTopic) {
     rules.push(
-               "Knee pain with MT/STM mention detected: include STM to release IT band, distal quads, popliteus, distal medial/lateral HS, and proximal medial gastroc."
+               "Knee topic: you MUST explicitly name these tissues when describing MT/STM (do not generalize): IT band, distal quads, popliteus, distal medial/lateral HS, and proximal medial gastroc."
                );
   }
   
-  // Rule 8: Patella hypomobile -> GPM III-IV
+  // 8) Patella hypomobile -> GPM III-IV
   if (t.patellaHypomobile) {
     rules.push(
-               "Patella hypomobile detected: include patellar joint mobilization using GPM III-IV in all directions to improve mobility and decrease pain."
+               "Patella hypomobile: include patellar joint mobilization using GPM III-IV in all directions to improve mobility and decrease pain."
                );
   }
   
-  // Rule 9: Poor posture / forward head -> postural training
+  // 9) Posture
   if (t.poorPosture) {
     rules.push(
-               "Poor posture/forward head detected: include postural training to improve awareness, upper back and T-spine strengthening, and pec minor stretching to improve posture."
+               "Posture impairment: include postural training to improve awareness, upper back and T-spine strengthening, and pec minor stretching to improve posture."
                );
   }
   
-  // Rule 10: Gait impairments / Trendelenburg / abnormal gait
+  // 10) Gait
   if (t.gaitImpairment) {
     rules.push(
-               "Gait impairment detected: include gait training/education to reduce deviations and improve gait mechanics, emphasizing increased step length/stride length and improved reciprocal movement as appropriate."
+               "Gait impairment: include gait training/education to reduce deviations and improve gait mechanics, emphasizing increased step length/stride length and improved reciprocal movement as appropriate."
                );
   }
   
-  // Required language checks to keep your style consistent
   rules.push('Use PT abbreviations where appropriate (STM, TherEx, TherAct, HEP, ADLs, GPM).');
   
   return rules;
 }
+
+// ---------------- Muscle Specificity Validator + Repair ----------------
+
+function mustIncludeAny(summary, terms) {
+  const s = String(summary || "").toLowerCase();
+  return terms.some((t) => s.includes(String(t).toLowerCase()));
+}
+
+function validateMuscleSpecificityPT(summaryText, fields) {
+  const t = detectAssessmentTopicsPT(fields);
+  const txt = String(summaryText || "");
+  
+  // Enforce "at least one of the required list" for each topic present
+  if (t.shoulderTopic) {
+    const req = ["supraspinatus", "deltoid", "infraspinatus", "teres minor", "teres major", "lat"];
+    if (!mustIncludeAny(txt, req)) {
+      return {
+        ok: false,
+      reason:
+        "Shoulder topic requires explicit muscle names (supraspinatus, deltoid, infraspinatus, teres minor/major, lats).",
+      };
+    }
+  }
+  
+  if (t.neckTopic) {
+    const req = ["suboccip", "posterior cervical", "upper trap", "levator", "scm", "pec minor", "lat"];
+    if (!mustIncludeAny(txt, req)) {
+      return {
+        ok: false,
+      reason:
+        "Neck topic requires explicit tissue names (suboccipitals, posterior cervical, UT, levator scap, SCM, pec minor, lats).",
+      };
+    }
+  }
+  
+  if (t.lbpTopic) {
+    const req = ["paraspinal", "ql", "multif", "glute med", "tfl", "piriformis", "hamstring"];
+    if (!mustIncludeAny(txt, req)) {
+      return {
+        ok: false,
+      reason:
+        "LBP topic requires explicit tissue names (lumbar paraspinals, QL, multifidi, glute med, TFL, piriformis, HS).",
+      };
+    }
+  }
+  
+  if (t.kneeTopic) {
+    const req = ["it band", "distal quad", "popliteus", "hamstring", "gastroc"];
+    if (!mustIncludeAny(txt, req)) {
+      return {
+        ok: false,
+      reason:
+        "Knee topic requires explicit tissue names (ITB, distal quads, popliteus, distal HS, proximal medial gastroc).",
+      };
+    }
+  }
+  
+  return { ok: true };
+}
+
+// ---------------- Legacy text AI runner ----------------
 
 async function runSimpleTextAI({ purpose, fields, discipline, extraRules = [] }) {
   const safeDiscipline = normalizeDiscipline(discipline);
@@ -1167,10 +1246,9 @@ async function handlePTSummary(req, res) {
   try {
     const fields = buildFieldsMap(req.body);
     
-    // NEW: topic-aware Assessment Summary rules
     const assessmentRules = buildAssessmentSummaryRulesPT(fields);
     
-    const result = await runSimpleTextAI({
+    let result = await runSimpleTextAI({
     purpose:
       "Generate an Assessment Summary paragraph for a PT evaluation. 5–7 sentences in ONE paragraph. " +
       "Use PT abbreviations where appropriate. Do not include SOAP headers.",
@@ -1178,6 +1256,43 @@ async function handlePTSummary(req, res) {
       discipline: "PT",
       extraRules: assessmentRules,
     });
+    
+    // -------- NEW: enforce muscle specificity + auto repair ----------
+    const v1 = validateMuscleSpecificityPT(result, fields);
+    if (!v1.ok) {
+      const repairPrompt = `
+Rewrite the paragraph to comply WITHOUT adding new facts:
+- Keep 5–7 sentences, one paragraph, no bullets, no arrows.
+- Use "Pt" only (no they/their).
+- You MUST explicitly name the relevant muscles for the detected topic(s) instead of general terms like "shoulder region" or "back muscles".
+- Maintain the same meaning as the original.
+
+Detected requirement:
+${v1.reason}
+
+Original:
+${result}
+
+Now output the corrected paragraph only.
+`.trim();
+      
+      const repaired = await openai.chat.completions.create({
+        model: MODEL,
+        temperature: 0.1,
+        messages: [
+          { role: "system", content: "You are a PT documentation assistant. Do not invent facts." },
+          { role: "user", content: repairPrompt },
+        ],
+      });
+      
+      const repairedText = normalizeSpaces(repaired.choices?.[0]?.message?.content || result);
+      
+      const v2 = validateMuscleSpecificityPT(repairedText, fields);
+      if (v2.ok) return res.json({ result: repairedText });
+      
+      // If still fails, return repaired anyway + debug so you can see why
+      return res.json({ result: repairedText, debug: { muscleRuleFail: v1.reason } });
+    }
     
     return res.json({ result });
   } catch (err) {
