@@ -151,13 +151,15 @@ const SUMMARY_INTRO_PREFIXES = [
   "Pt displays ",
   "Pt shows ",
   "Pt completes",
-  "Therapy tx focuses on",
+  "Therapy tx focuses on ",
   "During today's tx, pt ",
   "Pt continues ",
   "Pt presents ",
   "Assessment displays",
   "Tx focused on ",
   "Functional mobility indicates pt ",
+  "Palpation indicates ",
+  "Pt participates with PT tx",
 ];
 
 const SUMMARY_CLOSERS = [
