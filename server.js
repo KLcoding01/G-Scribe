@@ -1151,10 +1151,14 @@ app.post("/generate", async (req, res) => {
           });
 
           if (!vFmt.ok) {
-            return res.status(422).json({
-              error: "Muscle enforcement repair broke formatting constraints.",
-              reason: vFmt.reason,
-              raw: out2,
+            // ✅ Non-fatal: keep the already-validated output and return it
+            return res.json({
+              summary: out,
+              debug: {
+                muscleRepairBrokeFormatting: true,
+                formattingReason: vFmt.reason,
+                muscleRuleFail: vMuscle.reason,
+              },
             });
           }
 
