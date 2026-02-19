@@ -1151,12 +1151,56 @@ app.post("/generate", async (req, res) => {
           });
 
           if (!vFmt.ok) {
-            // ✅ Non-fatal: keep the already-validated output and return it
+            // Try one more pass: format-only repair (no new content)
+            const formatOnlyRepairPrompt = `
+          Return the note in EXACTLY this format:
+          
+          Subjective
+          <ONE sentence>
+          
+          Summary
+          <5-7 sentences, single paragraph>
+          
+          POC
+          <ONE line>
+          
+          Do NOT add or remove any facts. Keep the same meaning as the bad output.
+          
+          Bad output:
+          ${out2}
+          `.trim();
+          
+            const repair3 = await openai.chat.completions.create({
+              model: MODEL,
+              temperature: 0.05,
+              messages: [
+                { role: "system", content: "Fix formatting only. Do not add facts. Output only the corrected note." },
+                { role: "user", content: formatOnlyRepairPrompt },
+              ],
+            });
+          
+            const out3 = normalizeNewlines(repair3.choices?.[0]?.message?.content || out2);
+          
+            const vFmt3 = validateGenerated({
+              text: out3,
+              introPrefix,
+              closerSentence,
+              pocOpener,
+              discipline,
+              enforceVisitSummaryRules,
+            });
+          
+            if (vFmt3.ok) {
+              return res.json({ summary: out3, debug: { muscleRepairFormatOnlyPass: true } });
+            }
+          
+            // Still broken => non-fatal fallback
             return res.json({
               summary: out,
               debug: {
                 muscleRepairBrokeFormatting: true,
                 formattingReason: vFmt.reason,
+                formattingReasonAfterFormatOnly: vFmt3.reason,
                 muscleRuleFail: vMuscle.reason,
               },
             });
